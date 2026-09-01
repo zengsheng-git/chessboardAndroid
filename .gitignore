@@ -17,3 +17,7 @@
 local.properties
 /VinXiangQi-1.4.0
 /keystore
+
+# 构建产物与工具索引（勿提交）
+*.apk
+.codegraph/

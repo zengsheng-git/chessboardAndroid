@@ -229,3 +229,194 @@ gradlew.bat --version     # 只验证 Gradle + JDK 工具链
 产物校验（`lib/arm64-v8a/libpikafish.so`）：
 - ELF magic `\x7fELF` ✅ · ELF64 ✅ · `ET_DYN` ✅ · **EM_AArch64 (183)** ✅
 - 剥离符号后 1.55 MB
+
+
+我把之前的分析再核对一遍，确认哪些是真问题、哪些已经失效。先做几个精确验证。
+核对完毕。先修正我之前的一个误判，然后给你确认过的、按优先级排好的问题清单。
+
+---
+
+## 先撤回一个误判
+
+我之前预判 **AGP 9 会因 `outputFileName`/`capitalize()` API 变更而编译失败** —— **实际构建通过，未命中**。AGP 9.0.1 仍兼容这套 API。这条可以从问题清单里划掉。
+
+---
+
+# 一、确认存在的 Bug（影响结果正确性）
+
+## 🔴 Bug 1：续着（ponder）的中文记谱是基于错误棋盘算的
+
+```79:80:app/src/main/java/com/yieye/xiangqi/AnalysisService.java
+                String chinaMove = (bestMove != null && bestMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, bestMove) : getString(R.string.unknown);
+                String chinaMove2 = (ponderMove != null && ponderMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, ponderMove) : getString(R.string.none_ponder);
+```
+
+两次调用都传**同一个 `sourceFen`**。但 ponder 是「走了 bestMove 之后对方的应手」，它应该作用在**走完 bestmove 之后的棋盘**上。
+
+后果分两种情况：
+- ponder 的起点格在原始棋盘上是空的（比如我方刚走的那步吃掉了对方的子）→ `fenToChina` 里 `if (name == null || name.isEmpty()) continue;` 直接跳过，**返回原始 UCI 串**（如 `h7e7`）
+- 起点格恰好有对方棋子 → 会算出中文，但**是错的棋子在走**
+
+**修法**：`Utils.fenToChina(ctx, board, moves, redSide)` 本身就支持连续走子（内部会更新棋盘），只要把两个 move 放进同一个数组一次调用，再按空格拆开即可：
+
+```java
+String[] both = Utils.fenToChina(this, sourceFen, new String[]{bestMove, ponderMove}, redSide);
+// 拆成 chinaMove / chinaMove2
+```
+
+## 🔴 Bug 2：识别不到任何棋子时，返回一个假的开局局面
+
+```199:201:app/src/main/java/com/yieye/xiangqi/ChessBoardParser.java
+        if (validPieces.isEmpty()) {
+            return "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
+        }
+```
+
+这是致命兜底。当 YOLO 一枚棋子都没检出（棋盘被遮挡、识别失败、切到别的 App）时，它返回**标准开局 FEN**。这个 FEN **能通过 `isValidFen` 校验**，于是引擎会认真分析一个根本不存在的局面，悬浮窗显示一条**假推荐**。
+
+而且由于 `lastFen` 去重，假局面会一直占着位置，直到下次局面变化。**修法**：返回 `null`，让上层走"未识别"分支。
+
+## 🔴 Bug 3：`mySide` 每帧被覆盖，朝向识别抖动会导致分析时机错乱
+
+```239:243:app/src/main/java/com/yieye/xiangqi/AnalysisService.java
+//                        if (mySide == null) {
+                        mySide = fen.split(" ")[1];
+                        LogUtil.i(TAG, getString(R.string.auto_identify_side) + ...);
+//                        }
+```
+
+注释写着"首帧自动识别"，但保护被注释掉了，**每帧都重算**。目前能工作纯属巧合 —— 因为 `boardToFen` 的第三个参数 `nextPlayer` 恒等于 `redSide ? "w" : "b"`（是**朝向**不是行棋方），所以这个值恰好稳定。
+
+一旦某帧 YOLO 把 `r_jiang` 判错导致朝向翻转，`mySide` 立即翻转，「只在我方回合分析」的过滤就反向了 —— **该分析的时候等，不该分析的时候空转**。
+
+**修法**：加迟滞（连续 N 帧一致才切换），或恢复 `if (mySide == null)` 并提供手动设置入口。
+
+## 🔴 Bug 4：棋盘裁剪缓存只增不清，可能永久卡死
+
+```55:72:app/src/main/java/com/yieye/xiangqi/ChessBoardParser.java
+        if (cachedCropRect != null) {
+            try {
+                int cropY = (int) cachedCropRect.top;
+                int cropHeight = (int) cachedCropRect.height();
+                if (cropY >= 0 && cropY + cropHeight <= imgHeight) {
+                    return Bitmap.createBitmap(bitmap, 0, cropY, imgWidth, cropHeight);
+                } else {
+                    cachedCropRect = null;
+                }
+            } ...
+```
+
+`cachedCropRect` 只在**越界**时才失效，且全项目只有 `onDestroy` 里的 `clearCropCache()` 会清它（已确认仅这一处调用）。
+
+后果：一旦某次识别成功缓存了坐标，之后如果棋盘**在屏幕上纵向移动了**（换 App、换棋局、页面滚动），裁剪框不再覆盖棋盘 → YOLO 检出棋子数为 0 → 触发 Bug 2 的假开局 FEN，**且永远无法自愈**，只能重启服务。
+
+**修法**：当 `parse` 返回 null（未识别出局面）时也清空 `cachedCropRect`，让下一帧重新跑一次全图检测。
+
+---
+
+# 二、性能问题（体验影响最大）
+
+## 🟠 整条分析链路跑在主线程
+
+```36:36:app/src/main/java/com/yieye/xiangqi/AnalysisService.java
+    private Handler handler = new Handler();
+```
+
+`new Handler()` 是主线程 Looper。`captureAndAnalyze()` 里同步执行：
+
+- 全屏 Bitmap 解码（1080×2400 ≈ 10 MB）
+- `smartCrop` 一次 YOLO 640×640 推理（缓存冷启动时）
+- `parse` 再一次 YOLO 推理
+- pHash + FEN 生成 + `compareBoard`
+
+中低端机上单帧 **300–800 ms**，全卡在服务主线程。项目里**没有后台线程池**。引擎的 `go` 是异步的所以那部分没事，但推理和图像处理都在 UI 线程。
+
+**修法**：换成 `HandlerThread`（改动最小，只改一行 Handler 构造 + 保证时序）或单线程 `ExecutorService`。这是**收益最大的一项**。
+
+## 🟠 提前终止搜索的功能实际是空操作
+
+```100:120:app/src/main/java/com/yieye/xiangqi/AnalysisService.java
+        engineHelper.infoEvent = (cmd, infos) -> {
+            if (stopTriggeredForCurrentAnalysis) return;
+            try {
+//                if (infos.containsKey("mate")) {
+//                    if (Integer.parseInt(infos.get("mate")) > 0) {
+//                        stopTriggeredForCurrentAnalysis = true;
+//                        ...
+//                    }
+//                } else if (infos.containsKey("score")) {
+//                    ...
+//                }
+            } catch (NumberFormatException ignored) {
+            }
+        };
+```
+
+整段被注释掉了。结果：
+- `infoEvent` 是空函数
+- `STOP_SCORE`、`stopTriggeredForCurrentAnalysis` 全是死变量
+- **README 宣称的"发现绝杀/大优提前终止"没有生效**，每个局面都跑满 5 秒或满深度
+
+已确认 `EngineHelper.handleOutputLine` 里 `mate` 的解析是**存在的**（`infos.put("mate", args[i+2])`），只是没人消费。恢复这段逻辑是可行的，且能明显省电、加快出结果。
+
+---
+
+# 三、健壮性 / 崩溃风险
+
+| # | 位置 | 问题 | 修法 |
+|---|---|---|---|
+| 5 | `FloatWindowManager.show()` → `windowManager.addView()` | 悬浮窗权限在服务运行期间被撤销时抛 `BadTokenException`，**服务直接崩** | `show()` 内加 `Settings.canDrawOverlays()` 判断 + try-catch |
+| 6 | `EngineHelper.startAnalyze()` | 不检查 `initialized`。引擎握手最长 5 秒，期间 `sendCommandJNI` 静默丢弃（`if (!g_uci) return;`）→ 这轮分析丢失，等 18 秒超时才恢复 | 开头加 `if (!initialized) return false;` |
+| 7 | `MainActivity:109` | `registerReceiver(resultReceiver, filter, Context.RECEIVER_EXPORTED)` 且发送端 `sendBroadcast` 未 `setPackage()` —— 任何 App 都能伪造分析结果 | 加 `intent.setPackage(getPackageName())` + 改用 `RECEIVER_NOT_EXPORTED` |
+| 8 | `MainActivity:187` | `spinnerDepth.getSelectedItem()` 在极端时序下可为 null → 拆箱 NPE | 加非空兜底 |
+| 9 | `YoloV11Detector.postProcess` | `output[4 + c][i]` 直接索引，模型通道数 ≠ 19 时 AIOOBE | 校验 `output.length >= 4 + NUM_CLASSES` |
+
+---
+
+# 四、死代码与体积（不影响功能，但值得清）
+
+| 项 | 大小/行数 | 说明 |
+|---|---|---|
+| `ImageHelper.java` | **237 行** | **全项目零引用**（已用 grep 确认）。其中的 `findImage` 是 O(W·H·w·h) 逐像素模板匹配，在手机上根本跑不动，是 C# 版残留 |
+| `ChessRecognizer.java` | 134 行 | 仅在 `ChessBoardParser:131` 的**注释行**里被提到，其余方法全无用 |
+| `Utils` 未用方法 | ~150 行 | `checkBoardValid`、`checkChessmanValid`、`mirrorFenLeftRight`、`mirrorFenRedBlack`、`point2Move`、`expendArea`、`restoreArea` —— **全部零调用**（已确认）。讽刺的是 `checkBoardValid` 正好是 Bug 2 需要的兵种位置合法性校验，写了却没用上 |
+| `MainActivity.drawDetections()` | 22 行 | 零调用，`debugImageView` 也是 `visibility="gone"` |
+| **Compose 全家桶** | ~7 个依赖 | `buildFeatures { compose true }` + activity-compose / compose-bom / material3 / ui-tooling 等，**项目零 Compose 代码**（主题是 XML 的 `Theme.MyApp`）。拖慢构建、增加体积 |
+| **`middle.onnx`** | **27.3 MB** | `USE_YOLO_V11 = true`，只在 YOLOv11 加载失败时兜底 → 27 MB 常驻 APK |
+| 无用权限 | — | `INTERNET`、`ACCESS_NETWORK_STATE`、`READ/WRITE_EXTERNAL_STORAGE` 全部未使用；`network_security_config.xml` 还开了 `cleartextTrafficPermitted="true"` |
+| AdMob 残留 | — | Manifest 里有 AdMob `APPLICATION_ID`（且是 Google 公开测试 ID），但依赖不在 `build.gradle` |
+
+**APK 现在是 106.7 MB**，砍掉 Compose + `middle.onnx` 能降到 **~70 MB**。
+
+---
+
+# 五、上架 / 合规
+
+- **`targetSdk 34`**：Google Play 现要求 ≥35，上架会被拒。改 `targetSdk 35` 即可（代码里已有 Android 14 的 `FOREGROUND_SERVICE_MEDIA_PROJECTION` 处理，兼容性风险不大）
+- **`THIRD_PARTY_NOTICES.md`** 引用了 `VinXiangQi-1.4.0/LICENSE`，但该目录不在仓库里
+- **电池优化按钮跳错页面**：`ACTION_APPLICATION_DETAILS_SETTINGS` 打开的是应用详情页，不是电池优化页，与按钮文案「电池优化设置」不符
+
+---
+
+# 六、建议的修复顺序
+
+| 优先级 | 项 | 收益 | 改动量 |
+|---|---|---|---|
+| **P0** | Bug 2 假开局 FEN | 消除**最误导用户**的问题 | 1 行 |
+| **P0** | Bug 4 裁剪缓存卡死 | 消除"识别永久失效" | 2 行 |
+| **P0** | Bug 1 ponder 记谱 | 显示正确的续着 | ~5 行 |
+| **P0** | #5 悬浮窗崩溃守卫 | 消除崩溃 | 3 行 |
+| **P1** | 分析链路移后台线程 | **流畅度提升最明显** | ~10 行 |
+| **P1** | 恢复提前终止 | 省电、出结果更快 | ~10 行 |
+| **P1** | Bug 3 mySide 迟滞 | 避免时机错乱 | ~5 行 |
+| **P2** | 清死代码 + 关 Compose + 删 onnx | **APK 106MB → ~70MB** | 删文件 |
+| **P2** | #7 广播收窄 | 安全 | 2 行 |
+| **P3** | targetSdk 35 | 上架需要 | 1 行 |
+
+---
+
+P0 四项都是小改动、零风险，改完可以直接用现成的 `build.bat` 重出包。要我动手吗？
+
+- **A**：只修 P0（4 项，约 10 分钟，改完重打包给你）
+- **B**：修 P0 + P1（6 项，约 30 分钟，包含性能优化）
+- **C**：连 P2 一起做（瘦身到 ~70MB + 清理死代码）

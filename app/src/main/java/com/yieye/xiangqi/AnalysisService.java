@@ -16,6 +16,7 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -33,7 +34,8 @@ public class AnalysisService extends Service {
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    private Handler handler = new Handler();
+    private HandlerThread workerThread;
+    private Handler handler; // 绑定到后台线程：避免 YOLO 推理阻塞服务主线程
     private WindowManager windowManager;
     private int screenWidth, screenHeight, screenDensity;
 
@@ -42,6 +44,8 @@ public class AnalysisService extends Service {
     private String[][] lastBoardArray = null;
     private String nextTurn = "w";
     private String mySide = null; // 初始为空，由第一帧自动识别
+    private int mySideStreak = 0;                       // 朝向识别连续不一致的帧数（迟滞防抖）
+    private static final int SIDE_SWITCH_THRESHOLD = 3; // 连续 N 帧不一致才允许切换我方颜色
     private EngineHelper engineHelper;
     private boolean isRunning = false;
     private volatile boolean isAnalyzing = false;
@@ -59,6 +63,13 @@ public class AnalysisService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+
+        // 用独立后台线程跑「截屏 → YOLO 识别 → FEN → 引擎指令」整条链路，
+        // 避免中低端机上每次推理把服务主线程卡住数百毫秒
+        workerThread = new HandlerThread("AnalysisWorker");
+        workerThread.start();
+        handler = new Handler(workerThread.getLooper());
+
         createNotificationChannel();
         startForeground(1, getNotification());
 
@@ -76,8 +87,24 @@ public class AnalysisService extends Service {
         engineHelper.bestMoveEvent = (sourceFen, bestMove, ponderMove) -> {
             long engineTime = System.currentTimeMillis() - lastAnalyzeStartTime;
             if (sourceFen != null && !sourceFen.isEmpty()) {
-                String chinaMove = (bestMove != null && bestMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, bestMove) : getString(R.string.unknown);
-                String chinaMove2 = (ponderMove != null && ponderMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, ponderMove) : getString(R.string.none_ponder);
+                // 先给默认值，避免 Java 确定性赋值分析报"可能未初始化"
+                String chinaMove = getString(R.string.unknown);
+                String chinaMove2 = getString(R.string.none_ponder);
+                boolean hasBest = bestMove != null && bestMove.length() >= 4;
+                boolean hasPonder = ponderMove != null && ponderMove.length() >= 4;
+                if (hasBest && hasPonder) {
+                    // 修复：续着必须作用在「走了最佳走法之后」的棋盘上。
+                    // 旧实现两次都传原始 sourceFen，续着的起点格在原局面下可能是空格，
+                    // 导致记谱失败回退成原始 UCI 串，或按错误的棋子记谱。
+                    String[] decoded = Utils.fenToChina(this, sourceFen,
+                            new String[]{bestMove, ponderMove}).split(" ");
+                    chinaMove = (decoded.length > 0 && !decoded[0].isEmpty()) ? decoded[0] : chinaMove;
+                    chinaMove2 = (decoded.length > 1 && !decoded[1].isEmpty()) ? decoded[1] : chinaMove2;
+                } else if (hasBest) {
+                    chinaMove = Utils.fenToChina(this, sourceFen, bestMove);
+                } else if (hasPonder) {
+                    chinaMove2 = Utils.fenToChina(this, sourceFen, ponderMove);
+                }
 
                 String turnStr = sourceFen.contains(" w ") ? getString(R.string.turn_red) : getString(R.string.turn_black);
                 String displayStr = turnStr + "\n" +
@@ -102,19 +129,19 @@ public class AnalysisService extends Service {
             // 不必再等满深度/满时间，直接提前终止搜索并使用当前的 pv 作为结果
             if (stopTriggeredForCurrentAnalysis) return;
             try {
-//                if (infos.containsKey("mate")) {
-//                    if (Integer.parseInt(infos.get("mate")) > 0) {
-//                        stopTriggeredForCurrentAnalysis = true;
-//                        LogUtil.i(TAG, "检测到必胜的绝杀，提前终止搜索");
-//                        engineHelper.sendCommand("stop");
-//                    }
-//                } else if (infos.containsKey("score")) {
-//                    if (Integer.parseInt(infos.get("score")) > STOP_SCORE) {
-//                        stopTriggeredForCurrentAnalysis = true;
-//                        LogUtil.i(TAG, "分数已超过 " + STOP_SCORE + "，提前终止搜索");
-//                        engineHelper.sendCommand("stop");
-//                    }
-//                }
+                if (infos.containsKey("mate")) {
+                    if (Integer.parseInt(infos.get("mate")) > 0) {
+                        stopTriggeredForCurrentAnalysis = true;
+                        LogUtil.i(TAG, "检测到必胜的绝杀，提前终止搜索");
+                        engineHelper.sendCommand("stop");
+                    }
+                } else if (infos.containsKey("score")) {
+                    if (Integer.parseInt(infos.get("score")) > STOP_SCORE) {
+                        stopTriggeredForCurrentAnalysis = true;
+                        LogUtil.i(TAG, "分数已超过 " + STOP_SCORE + "，提前终止搜索");
+                        engineHelper.sendCommand("stop");
+                    }
+                }
             } catch (NumberFormatException ignored) {
             }
         };
@@ -236,11 +263,24 @@ public class AnalysisService extends Service {
                         lastFen = fen;
 
 
-                        // 2. 自动识别我方颜色（默认底部为我方）
-//                        if (mySide == null) {
-                        mySide = fen.split(" ")[1];
-                        LogUtil.i(TAG, getString(R.string.auto_identify_side) + (mySide.equals("w") ? getString(R.string.side_red) : getString(R.string.side_black)) + getString(R.string.screen_bottom));
-//                        }
+                        // 2. 自动识别我方颜色（默认底部为我方），带迟滞防抖：
+                        // 需连续 SIDE_SWITCH_THRESHOLD 帧一致才允许切换，
+                        // 避免单帧 YOLO 误判 r_jiang 导致朝向翻转、分析时机错乱
+                        String detectedSide = fen.split(" ")[1];
+                        if (mySide == null) {
+                            mySide = detectedSide;
+                            mySideStreak = 1;
+                            LogUtil.i(TAG, getString(R.string.auto_identify_side) + (mySide.equals("w") ? getString(R.string.side_red) : getString(R.string.side_black)) + getString(R.string.screen_bottom));
+                        } else if (detectedSide.equals(mySide)) {
+                            mySideStreak = 1;
+                        } else {
+                            mySideStreak++;
+                            if (mySideStreak >= SIDE_SWITCH_THRESHOLD) {
+                                LogUtil.w(TAG, "朝向识别变化，切换我方为 " + (detectedSide.equals("w") ? getString(R.string.side_red) : getString(R.string.side_black)));
+                                mySide = detectedSide;
+                                mySideStreak = 1;
+                            }
+                        }
                         // 1. 解析当前棋盘数组 (Utils.fenToBoard 会根据 FEN 里的 w/b 自动处理旋转)
                         String[][] currentBoard = Utils.fenToBoard(fen);
 
@@ -259,12 +299,13 @@ public class AnalysisService extends Service {
                                     nextTurn = mySide;
                                 }
                             } else if (cmp.diffCount > 2) {
-                                // 变化较大（超过2格），可能是新开局或摆子，使用识别到的默认方位
-                                nextTurn = fen.split(" ")[1];
+                                // 变化较大（超过2格），可能是新开局或摆子，
+                                // 使用防抖后的我方方位作为默认行棋方，避免单帧噪声干扰
+                                nextTurn = mySide;
                             }
                         } else {
-                            // 第一次识别，使用默认
-                            nextTurn = fen.split(" ")[1];
+                            // 第一次识别，使用防抖后的我方方位
+                            nextTurn = mySide;
                         }
                         lastBoardArray = currentBoard;
 
@@ -383,6 +424,7 @@ public class AnalysisService extends Service {
         if (engineHelper != null) engineHelper.stop();
         ChessBoardParser.clearCropCache();
         FloatWindowManager.getInstance(this).hide();
+        if (workerThread != null) workerThread.quitSafely();
         super.onDestroy();
     }
 

@@ -148,13 +148,20 @@ public class ChessBoardParser {
                 ChessDetector detector = getDetector(context);
                 List<YoloResult> results = detector.detect(bitmap);
                 if (results == null || results.isEmpty()) {
+                    // 修复：识别失败时清空裁剪缓存，让下一帧重新做全图检测。
+                    // 否则棋盘在屏幕上位置一旦变化（换 App/换棋局/页面滚动），
+                    // 过期的裁剪框会一直产出无效画面，且永远无法自愈。
+                    clearCropCache();
                     callback.onResult(null, null);
                     return;
                 }
                 String fen = resultsToFen(results);
+                if (fen == null) {
+                    clearCropCache();
+                }
                 callback.onResult(fen, results);
             } catch (Exception e) {
-//                LogUtil.e(TAG, "Parsing error", e);
+                clearCropCache();
                 callback.onResult(null, null);
             } finally {
                 // 识别线程负责回收它拿到的这个位图
@@ -197,7 +204,10 @@ public class ChessBoardParser {
         }
 
         if (validPieces.isEmpty()) {
-            return "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
+            // 修复：原先这里返回标准开局 FEN 作为兜底。该局面能通过 isValidFen 校验，
+            // 导致引擎认真分析一个根本不存在的"开局"，悬浮窗显示假推荐。
+            // 现在返回 null，让上层走"未识别"分支。
+            return null;
         }
 
         // 如果识别到了board标签，则使用标签；否则使用棋子包络矩形

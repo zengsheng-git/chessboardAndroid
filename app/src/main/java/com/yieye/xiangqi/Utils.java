@@ -125,18 +125,6 @@ public class Utils {
         return fenToChina(context, board, new String[]{move}, redSide);
     }
 
-    /**
-     * 将 FEN 局面下的多个连续走法依次转成中文记谱。
-     * 与单走法版本不同，这里会让每个走法依次作用在更新后的棋盘上，
-     * 因此可用于「最佳走法 + 续着」这类后续走法依赖前序走法的场景。
-     */
-    public static String fenToChina(Context context, String fen, String[] moves) {
-        String[][] board = fenToBoard(fen);
-        String[] parts = fen.split(" ");
-        boolean redSide = parts.length > 1 && parts[1].equals("w");
-        return fenToChina(context, board, moves, redSide);
-    }
-
     public static String fenToChina(Context context, String[][] cboard, String[] moves, boolean redSide) {
         String[][] board = new String[9][10];
         for (int i = 0; i < 9; i++) {

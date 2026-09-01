@@ -3,7 +3,6 @@ package com.yieye.xiangqi;
 import android.content.Context;
 import android.graphics.PixelFormat;
 import android.os.Build;
-import android.provider.Settings;
 import android.view.Gravity;
 import android.view.LayoutInflater;
 import android.view.MotionEvent;
@@ -33,11 +32,6 @@ public class FloatWindowManager {
 
     public void show() {
         if (floatView != null) return;
-
-        // 防止悬浮窗权限在服务运行期间被撤销后 addView 抛 BadTokenException 导致服务崩溃
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
-            return;
-        }
 
         floatView = LayoutInflater.from(context).inflate(R.layout.float_window_layout, null);
         moveTextView = floatView.findViewById(R.id.float_move_text);
@@ -82,14 +76,7 @@ public class FloatWindowManager {
             }
         });
 
-        try {
-            windowManager.addView(floatView, layoutParams);
-        } catch (Exception e) {
-            // 权限失效或窗口类型异常时不让服务崩溃
-            floatView = null;
-            moveTextView = null;
-            layoutParams = null;
-        }
+        windowManager.addView(floatView, layoutParams);
     }
 
     public void updateMove(String move) {

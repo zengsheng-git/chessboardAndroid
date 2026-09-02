@@ -23,7 +23,7 @@
     <string name="side_black">Bên Đen</string>
     <string name="board_change_my_turn">Cục diện thay đổi (Đến lượt ta %s), bắt đầu phân tích...</string>
     <string name="board_change_oppo_turn">Cục diện thay đổi (Đến lượt đối phương %s), đang chờ...</string>
-    <string name="analyzing">Đến lượt ta, đang phân tích...\n</string>
+    <string name="analyzing">Đang phân tích...\n</string>
     <string name="waiting">Đến lượt đối phương, đang chờ...\n</string>
     <string name="service_notification_title">Tự động nhận diện bàn cờ</string>
     <string name="service_notification_text">Đang giám sát cục diện màn hình...</string>

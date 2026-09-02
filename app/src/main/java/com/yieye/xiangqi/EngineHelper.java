@@ -80,7 +80,8 @@ public class EngineHelper {
 
         Thread engineThread = new Thread(() -> {
             try {
-                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                // 不设置 THREAD_PRIORITY_BACKGROUND：该优先级会把引擎线程（含其创建的搜索线程）
+                // 归入系统后台 cgroup 被 CPU 限速，导致搜索深度/速度明显打折
                 initJNI(workDir);
 
                 int waitCount = 0;

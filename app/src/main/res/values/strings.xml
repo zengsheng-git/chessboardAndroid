@@ -23,7 +23,7 @@
     <string name="side_black">黑方</string>
     <string name="board_change_my_turn">局面变化 (轮到我方%s)，开始分析...</string>
     <string name="board_change_oppo_turn">局面变化 (轮到对方%s)，等待...</string>
-    <string name="analyzing">轮到我方 正在分析...\n</string>
+    <string name="analyzing">正在分析...\n</string>
     <string name="waiting">轮到对方 等待中...\n</string>
     <string name="service_notification_title">棋盘自动识别中</string>
     <string name="service_notification_text">正在监控屏幕局面...</string>

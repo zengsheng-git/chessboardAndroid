@@ -197,7 +197,10 @@ public class ChessBoardParser {
         }
 
         if (validPieces.isEmpty()) {
-            return "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C5C1/9/RNBAKABNR w - - 0 1";
+            // 裁剪区域内没有棋子（首页/过渡画面/裁剪缓存错位）：返回 null 让上层跳过本帧。
+            // 绝不能返回虚构的标准开局 FEN——那会把"没有棋盘"伪装成"开局局面"，
+            // 污染 lastFen/expect 链路，导致切页面后悬浮窗永久停在"正在分析"
+            return null;
         }
 
         // 如果识别到了board标签，则使用标签；否则使用棋子包络矩形

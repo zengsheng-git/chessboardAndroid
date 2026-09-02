@@ -31,6 +31,8 @@ public class Utils {
         public Point to = new Point(-1, -1);
         public String chess;
         public String target;
+        // 消失格的原棋子（如"起点空了但终点没识别出来"时，它就是刚走的那颗子）
+        public String movedChess;
         public int diffCount;
         public int redDiff;
         public int blackDiff;
@@ -81,10 +83,21 @@ public class Utils {
     }
 
     public static String[][] fenToBoard(String fen) {
+        // 旧调用约定：FEN 第二段 = 屏幕底部方（识别 FEN 的语义）
+        String[] parts = fen.split(" ");
+        return fenToBoard(fen, parts.length > 1 && parts[1].equals("w"));
+    }
+
+    /**
+     * bottomIsRed = 屏幕底部方是否为红方（决定是否旋转）。
+     * 返回统一"红在屏幕下方"基准的数组，便于逐格比较与中文记谱。
+     * 注意：传入 finalFen（第二段 = 行棋方）时不能套用旧约定，
+     * 双方回合都分析后行棋方与底部方不总是一致，必须显式传入底部方。
+     */
+    public static String[][] fenToBoard(String fen, boolean bottomIsRed) {
         String[][] board = new String[9][10];
         String[] parts = fen.split(" ");
         String[] rows = parts[0].split("/");
-        boolean redSide = parts.length > 1 && parts[1].equals("w");
 
         Map<Character, String> fenMap = new HashMap<>();
         fenMap.put('r', "che"); fenMap.put('n', "ma"); fenMap.put('b', "xiang");
@@ -106,7 +119,7 @@ public class Utils {
                 }
             }
         }
-        if (!redSide) {
+        if (!bottomIsRed) {
             String[][] rotatedBoard = new String[9][10];
             for (int x = 0; x < 9; x++) {
                 for (int y = 0; y < 10; y++) {
@@ -118,11 +131,14 @@ public class Utils {
         return board;
     }
 
-    public static String fenToChina(Context context, String fen, String move) {
-        String[][] board = fenToBoard(fen);
-        String[] parts = fen.split(" ");
-        boolean redSide = parts.length > 1 && parts[1].equals("w");
-        return fenToChina(context, board, new String[]{move}, redSide);
+    /**
+     * 中文记谱。bottomIsRed = 屏幕底部方是否为红方（决定坐标翻转方向），
+     * 注意它不是行棋方——双方回合都分析时行棋方与底部方不总是一致。
+     * fen 为标准 FEN（第二段 = 行棋方，用于棋子名查询前的局面还原）。
+     */
+    public static String fenToChina(Context context, String fen, String move, boolean bottomIsRed) {
+        String[][] board = fenToBoard(fen, bottomIsRed);
+        return fenToChina(context, board, new String[]{move}, bottomIsRed);
     }
 
     public static String fenToChina(Context context, String[][] cboard, String[] moves, boolean redSide) {
@@ -227,6 +243,7 @@ public class Utils {
                 if (from[x][y] == null ? to[x][y] != null : !from[x][y].equals(to[x][y])) {
                     if (to[x][y] == null) {
                         result.from = new Point(x, y);
+                        result.movedChess = from[x][y];
                     } else {
                         result.to = new Point(x, y);
                         result.chess = to[x][y];
@@ -303,6 +320,31 @@ public class Utils {
         }
 
         return fen.toString() + " " + nextPlayer;
+    }
+
+    /**
+     * 把一步 UCI 着法应用到局面，返回走完后的 FEN（第二段 = 对方行棋，仅两段）。
+     * 用于生成"预期棋盘"：对手按预期走子时可直接命中，无需再做行棋方推导。
+     * fen 需为标准方向 FEN（第二段 = 行棋方，如引擎的 finalFen）。
+     * UCI 坐标约定：x 与 FEN 同向（a..i = 0..8），y 与 FEN 反向（0 = 红方底线）。
+     */
+    public static String applyMoveToFen(String fen, String move) {
+        if (fen == null || move == null || move.length() < 4) return null;
+        String[] parts = fen.split(" ");
+        boolean redToMove = parts.length > 1 && parts[1].equals("w");
+        // 不旋转：与 FEN 坐标系保持一致；move2Point(redSide=true) 即 UCI→FEN 坐标转换
+        String[][] board = fenToBoard(fen, true);
+        Point from = move2Point(move.substring(0, 2), true);
+        Point to = move2Point(move.substring(2, 4), true);
+        try {
+            String piece = board[from.x][from.y];
+            if (piece == null) return null;
+            board[to.x][to.y] = piece;
+            board[from.x][from.y] = null;
+        } catch (ArrayIndexOutOfBoundsException e) {
+            return null;
+        }
+        return boardToFen(board, "w", redToMove ? "b" : "w");
     }
 
     public static String mirrorFenLeftRight(String fen) {

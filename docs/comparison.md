@@ -1,70 +1,78 @@
 # 弈眼（Android）与桌面端 chessboard 实现对照
 
-> 对照基准：桌面端 `chessboard`（Tauri + Rust，`server/src/`）vs Android 弈眼 0.0.19（`app/src/main/java/com/yieye/xiangqi/`）。
-> 结论先行：**识别层、状态机语义、阻塞式搜索已对齐桌面端**；Android 多出移动端补偿机制；
-> 功能上 Android 尚缺云库之外的**完整候选展示历史**、**九宫位置校验已于 0.0.19 补齐**等，详见文末差异清单。
+> 基准：桌面端 `chessboard`（Tauri + Rust，`server/src/`）vs 弈眼 Android **0.0.34**
+> （`app/src/main/java/com/yieye/xiangqi/`）。0.0.34 已完成识别层、状态机、引擎设置与桌面端的对齐。
 
 ## 一、总体架构
 
-| | 桌面端 chessboard | 弈眼 Android |
+| | 桌面端 chessboard | 弈眼 Android 0.0.34 |
 |---|---|---|
-| 形态 | Tauri 桌面应用（Rust 后端 + Vue 前端） | Android Service（Java）+ 悬浮窗 |
+| 形态 | Tauri 桌面应用（Rust 后端 + Vue 前端） | Android Service（Java）+ 悬浮窗富文本 |
 | 截屏 | xcap **拉式**窗口捕获（每拍必有画面） | VirtualDisplay+ImageReader **推式** + 最近帧缓存（等价改造） |
-| 识别 | ONNX Runtime，`large.onnx`，置信度 0.7，NMS 内嵌按类 LIMIT | ONNX Runtime，`middle.onnx`（= `large.onnx`，MD5 一致），0.7 + `applyClassLimits`，王类九宫内 0.2 |
-| 引擎 | Pikafish 独立进程（UCI 管道），Threads=4 | Pikafish JNI 进程内，Threads=1 + Slow Mover 50 |
+| 识别模型 | `large.onnx`，置信度 **0.7**，NMS 内嵌按类 LIMIT | `yolov11.onnx`，置信度 **0.35**（手机采集域调优），NMS 后按类 LIMIT；王类九宫内放宽 0.2 |
+| 引擎 | Pikafish **独立进程**（UCI 管道），Threads=4 | Pikafish **JNI 进程内**，Threads=4 |
 | 搜索 | `block_on(engine.search())` 阻塞，单搜索在飞 | `EngineHelper.searchSync` latch 阻塞，单搜索在飞 |
-| 循环 | `process_analysis_loop` 200ms 节拍单线程 | `loopForever` 300ms 节拍单线程 |
-| 引擎生命周期 | 应用级单例（`OnceLock`），不随监听重建 | **进程级单例**（0.0.18 修复：原随会话重建导致回调错位、搜索全超时） |
-| 云库 | chessdb querypv（5s 超时，命中秒出招） | ✅ `ChessDB.query`（0.0.19 起，带 5 分钟熔断） |
-| MultiPV 次优候选 | ✅ multipv=3 + alt_score_gap=300 | ✅ 0.0.19 起（悬浮窗"备选:"行） |
+| 引擎生命周期 | 应用级单例（`OnceLock`），不随监听重建 | **进程级单例**（0.0.18 修复回调错位），跨会话复用 |
+| 循环节拍 | 200ms | 300ms（含截屏+哈希开销） |
+| 云库 | chessdb querypv（5s 超时） | ✅ `ChessDB.query`（同协议，5s，带 5 分钟熔断） |
 
-## 二、状态机与行棋方推断对照
+## 二、功能对照
 
-桌面端 `worker.rs` 状态：Initial / StartPos / OurTurn / OpponentTurn / Invalid。
-Android 0.0.18+：INITIAL / GENERIC / INVALID（StartPos 并入 GENERIC，行为等价）。
+| 功能 | 桌面端 | Android | 说明 |
+|---|---|---|---|
+| 实时监听出招 | ✅ | ✅ | 核心功能一致 |
+| expect_board 预判 | ✅ | ✅ | 命中秒出下一回合提示 |
+| confirm 稳定确认 | ✅ 100ms+间隔 | ✅ 200ms | |
+| board_diff 分类（One/Move/Unknown） | ✅ | ✅ | 走子方均取消失格棋子 |
+| 未知变化处理 | Unknown → 重锚定 | 噪声跳过 + 连续 8 拍强制兜底 | Android 防无限沉默的加固 |
+| 丢王修复 + 王位记忆 | ❌（board_check 判废） | ✅ 原位/记忆位兜底 | 手机识别在将军高亮下丢王，补偿机制 |
+| 幻影/噪声帧拦截 | ❌（识别稳不需要） | ✅ pHash 回滚 + 帧级守卫 | 同上 |
+| 心跳看门狗（native 挂死自愈） | ❌ | ✅ 30s dump + 重建检测器 | |
+| pHash 去重 | ❌（每拍全量识别） | ✅（功耗优化） | |
+| **云库查询**（chessdb querypv） | ✅ | ✅（0.0.19 起，含熔断） | |
+| **MultiPV 次优候选** | ✅ multipv=3 + alt_score_gap=300；云库无次优时本地引擎补充 | ✅（0.0.19 起；0.0.34 起云库次优同样由本地引擎补充） | 悬浮窗附与最优的相对分数 |
+| **九宫/兵卒位置合法性校验** | ✅ board_check | ✅（0.0.27 起，对齐位置规则） | |
+| 引擎设置（Threads/Hash/60步规则） | Threads=4 / Hash=64 / 60步=false | ✅ 已对齐（0.0.22 起） | |
+| 默认搜索深度 | 20 | 20（0.0.23 起默认，界面可调 6~30） | |
+| 每步思考上限 | 5000ms | 5000ms | |
+| 悬浮窗富文本/来源/形势标注 | ❌（完整棋盘 UI 另说） | ✅ 蓝招法/紫备选/绿红形势/橙深度 | |
+| 出招先验货（防过期提示） | 结构上不产生过期提示 | ✅ 验货丢弃 + 静默期恢复旧提示 | |
+| 完整棋盘镜像 UI + 候选落点高亮 | ✅ 前端 | ❌ 仅悬浮窗文本 | 若需要属新功能开发 |
+| 可配置化（config.json） | ✅ | ❌ 常量 + 深度选择器 | 可跟进 |
+| GPU/其他执行提供 | ✅ CUDA/DirectML/CoreML | ❌ CPU EP | 可跟进 |
 
-| 情形 | 桌面端 | Android |
-|---|---|---|
-| 棋盘未变化 | 保持状态 | `boardPart` 相同 → 跳过 |
-| 命中预期棋盘 | 分析 `expect_move.camp.opposite()` | 相同（`expectNextTurn`） |
-| 延迟确认失败 | sleep confirm_interval，保持 | 相同（200ms） |
-| board_check 不过 | 保持 | `isValidFen` 失败 → 跳过 |
-| diff=2（一空一占） | Move：走子方 = 消失格棋子 | 相同（`movedChess`） |
-| diff=1 | One：计数，3 次重锚定 | 半步（起点消失）视为走子立即分析；幻影出现则跳过计数 |
-| diff≥3 | Unknown：重锚定 | 子数不变 → 偶数步合并帧（行棋方不变）；恰一方少一子 → 轮到被吃方；其余 → 底部方兜底；连续 8 拍噪声强制兜底 |
+## 三、同一功能的不同实现细节
 
-> 差异说明：Android 的识别（手机端腾讯象棋 UI 特效）比桌面端（PC 象棋软件窗口）抖动大，
-> 因此在桌面端语义之上增加了**噪声帧不分析不锚定**与**合并帧奇偶/吃子推断**两层加固。
+1. **走子方推断**：两边都取"消失格棋子"定走子方。Android 额外处理了合并帧
+   （两步并一帧 → 子数不变则行棋方不变；恰一方少一子 → 轮到被吃方）与幻影帧拦截。
+2. **单格变化**：桌面 One → 计数 3 次重锚定；Android 半步（仅起点消失）按走子处理
+   （推式截屏 + pHash 下"等下一帧"会永久饥饿），纯幻影出现则跳过。
+3. **未知变化**：桌面 Unknown → 重锚定；Android 噪声跳过（恢复旧提示）+ 连续 8 拍强制兜底。
+4. **截屏域差异**：桌面拉式（每拍必有画面）；Android 推式 + 最近帧缓存 + pHash 去重
+   （静止期不重复识别，功耗优）。
+5. **引擎通道**：桌面 UCI 子进程管道；Android JNI 进程内 + CountDownLatch 阻塞。
+   均保证"任何时刻最多一个在途搜索"。
+6. **mate 分数编码**：两边一致（±(30000−步数)），候选取舍与"形势"翻译共用同一公式。
+7. **配置**：桌面 config.json 可热改；Android 为编译期常量 + 深度选择器 + 王位记忆持久化。
 
-## 三、识别后处理对照
+## 四、Android 多出的机制（移动端补偿）
 
-| | 桌面端 yolo.rs | Android |
-|---|---|---|
-| 置信度门槛 | 0.7（单门：obj × 类别概率） | 0.7；王类九宫内放宽到 0.2（将军高亮/装饰环拉低王置信度的补偿） |
-| 每类数量上限 | NMS 内嵌 LIMIT（车马炮士象 ≤2、兵 ≤5、board 1） | NMS 后 `applyClassLimits` 同规则 |
-| 整帧校验 | `board_check`：双王 + 上限 + **九宫/兵卒位置** | `isValidFen`：0.0.19 起对齐九宫/兵卒位置规则 |
-
-## 四、云库（chessdb）对照
-
-| | 桌面端 | Android（0.0.19 起） |
-|---|---|---|
-| 接口 | `querypv?board=<fen>` | 相同 |
-| 响应 | ""/unknown/invalid board/checkmate/stalemate/score+depth+pv | 相同协议解析 |
-| 命中行为 | 直接采用 pv 首着，source=云库 | 相同（悬浮窗推荐后缀 `[云库]`） |
-| 失败回退 | 落本地引擎 | 相同；另有**熔断**：连续 2 次不可达 → 5 分钟内直落本地 |
-
-## 五、Android 相对桌面端多出的机制（移动端补偿）
-
-- 看门狗（ONNX 推理挂死 30s 自愈：dump 堆栈 + 重建检测器 + 换线程）
+- 心跳看门狗（ONNX 推理挂死 30s 自愈：dump 堆栈 + 重建检测器 + 换线程）
 - 截屏最近帧缓存（推式截屏的静止期饥饿补偿）
-- 丢王一致性修复 + 跨会话王位记忆（SharedPreferences）
+- 丢王一致性修复 + 跨会话王位记忆
 - 幻影/半步/不成对帧的显式拦截与 pHash 回滚
-- pHash 去重（功耗优化；桌面端每拍全量识别）
-- 引擎进程内 JNI（无子进程；代价是引擎崩溃会波及主进程，由 isValidFen 前置拦截兜底）
+- pHash 去重、悬浮窗富文本、出招先验货、INITIAL 合法性门槛
 
-## 六、Android 尚缺 / 可选跟进
+## 五、Android 尚缺 / 可选跟进
 
 - 完整棋盘镜像 UI 与着法列表（当前仅悬浮窗文本）
-- config.json 式的可配置化（循环节拍/门槛/云库开关目前为常量）
-- 桌面端 GPU 执行提供（Android 为 CPU EP）
+- config.json 式可配置化（循环节拍/门槛/云库开关为编译期常量）
+- GPU/其他执行提供（Android 为 CPU EP）
 - 残局挑战装饰环的模型微调（识别根治方案）
+
+## 六、已知边界（两端共有）
+
+- 复盘/浏览历史局面时"轮到谁"画面上不存在：按屏幕底部方启发式猜测，
+  走一步后自动纠正；
+- 识别置信度受 UI 特效（高亮/动画）影响：两端都以"确认 + 分类门槛"抵御，
+  Android 另有噪声帧跳过与王位记忆兜底。

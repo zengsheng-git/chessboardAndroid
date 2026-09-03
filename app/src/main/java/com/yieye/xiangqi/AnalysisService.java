@@ -84,7 +84,6 @@ public class AnalysisService extends Service {
     private String expectBoardFen = null;     // 预期棋盘（bestMove 走完后）的 FEN 棋盘段
     private String expectNextTurn = null;     // 预期棋盘的行棋方
     private String nextTurn = "w";            // 上一次分析局面的行棋方（奇偶合并帧推断用）
-    private int invalidChangeCount = 0;       // 桌面端 invalid_change_count
     private int untrustedCount = 0;           // 连续不可信帧（幻影/王不可见）计数
     // 最近一次有效识别的将/帅位置 {x,y}。跨重锚定/跨会话保留（SharedPreferences）：
     // 将军高亮会让 YOLO 持续丢识别王，而缺王局面无法分析，王位记忆是唯一可靠修复来源
@@ -106,6 +105,17 @@ public class AnalysisService extends Service {
         if (pendingPrevHas) {
             lastCroppedHash = pendingPrevHash;
             hasLastCroppedHash = pendingPrevHas;
+        }
+    }
+
+    /**
+     * 悬浮窗若停留在"正在分析"而实际并无搜索在跑（分析被丢弃/识别噪声跳过），
+     * 恢复显示最近一条有效提示，避免假的分析状态长期挂屏误导用户
+     */
+    private void restoreWindowIfAnalyzing() {
+        if (windowShowsAnalyzing && lastResult != null && !lastResult.isEmpty()) {
+            windowShowsAnalyzing = false;
+            FloatWindowManager.getInstance(this).updateMove(lastResult);
         }
     }
 
@@ -281,7 +291,9 @@ public class AnalysisService extends Service {
             return;
         }
         if (f.degraded) {
-            // 将/帅被高亮遮挡且疑似已移动：保留悬浮窗旧提示，不锚定坏帧，等识别恢复
+            // 将/帅被高亮遮挡且疑似已移动：不锚定坏帧，等识别恢复。
+            // 悬浮窗若停留在"正在分析"（上一轮分析被中止），恢复为上一条有效提示
+            restoreWindowIfAnalyzing();
             return;
         }
 
@@ -330,6 +342,7 @@ public class AnalysisService extends Service {
                 // 棋盘有效性检查（桌面端 board_check；非法局面会导致引擎原生层崩溃）
                 if (!engineHelper.isValidFen(f.fen)) {
                     LogUtil.w(TAG, "棋盘识别无效: " + f.fen);
+                    restoreWindowIfAnalyzing();
                     break;
                 }
 
@@ -400,11 +413,13 @@ public class AnalysisService extends Service {
         String source = null;
         EngineHelper.SearchResult r;
 
-        // ① 云库优先（桌面端 search 语义）：chessdb 命中则秒出招，未命中/网络失败
-        //    落本地引擎；云库判非法（多为识别缺子/错子）则按无效帧跳过
-        ChessDB.Result cloud = queryCloudSafe(f.boardPart + " " + turn, 5);
+        // ① 云库优先（桌面端 search 语义）：chessdb 命中则直接采用其最优线，未命中/网络失败
+        //    落本地引擎；云库判非法（多为识别缺子/错子）则按无效帧跳过。
+        //    桌面端同款行为：queryall 无次优时需等本地引擎补一次 MultiPV，此轮耗时≈引擎思考时间
+        ChessDB.Result cloud = queryCloudSafe(f.boardPart + " " + turn, 5, 3, 300);
         if (ChessDB.STATE_INVALID.equals(cloud.state)) {
             LogUtil.w(TAG, "云库判定局面非法，跳过本轮等待识别恢复");
+            restoreWindowIfAnalyzing();
             return;
         }
         if (ChessDB.STATE_SUCCESS.equals(cloud.state) && !cloud.pv.isEmpty()) {
@@ -414,6 +429,24 @@ public class AnalysisService extends Service {
             r.ponderMove = cloud.pv.size() > 1 ? cloud.pv.get(1) : null;
             r.score = cloud.score;
             r.depth = cloud.depth;
+            r.alternatives = cloud.alternatives;   // queryall 的真实次优（带云库评分）
+            // 对齐桌面端 engine/mod.rs：chessdb 的 queryall 对多数局面返回 unknown（库中
+            // 未评全所有着法），云库命中但无次优候选时，用本地引擎 MultiPV 补充次优。
+            // 只补候选：最优招/评分/深度/来源仍以云库为准
+            if (r.alternatives.isEmpty()) {
+                EngineHelper.SearchResult eng = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+                if (eng != null && eng.alternatives != null) {
+                    for (EngineHelper.AltCandidate alt : eng.alternatives) {
+                        if (r.alternatives.size() >= 2) break;   // multipv(3)-1 个上限
+                        if (alt.move == null || alt.move.equals(r.bestMove)) continue;
+                        boolean dup = false;
+                        for (EngineHelper.AltCandidate a : r.alternatives) {
+                            if (alt.move.equals(a.move)) { dup = true; break; }
+                        }
+                        if (!dup) r.alternatives.add(alt);
+                    }
+                }
+            }
         } else {
             source = "引擎";
             r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
@@ -461,6 +494,8 @@ public class AnalysisService extends Service {
 
         // ③ 次优候选（仅本地引擎 MultiPV 提供）：分数与最优差 ≤ alt_score_gap 的名次首着，
         //    括号内为与最优的相对分数（负值 = 比最优差多少），供直观判断候选质量
+        android.util.Log.d(TAG, "诊断: 候选数=" + (r.alternatives == null ? "null" : r.alternatives.size())
+                + " 来源=" + source);
         StringBuilder altTextSb = new StringBuilder();
         if (r.alternatives != null) {
             for (EngineHelper.AltCandidate a : r.alternatives) {
@@ -508,12 +543,12 @@ public class AnalysisService extends Service {
     }
 
     /** 云库查询（带熔断）：连续 2 次不可达则 5 分钟内直接走本地引擎，避免离线时每步白等 */
-    private ChessDB.Result queryCloudSafe(String fen, int timeoutSec) {
+    private ChessDB.Result queryCloudSafe(String fen, int timeoutSec, int multipv, int altScoreGap) {
         long now = SystemClock.elapsedRealtime();
         if (now < cloudCooldownUntil) {
             return new ChessDB.Result();   // unknown → 本地引擎
         }
-        ChessDB.Result r = ChessDB.query(fen, timeoutSec);
+        ChessDB.Result r = ChessDB.query(fen, timeoutSec, multipv, altScoreGap);
         if (ChessDB.STATE_UNKNOWN.equals(r.state)) {
             cloudFailStreak++;
             if (cloudFailStreak >= 2) {

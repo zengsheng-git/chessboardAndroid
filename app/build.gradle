@@ -19,8 +19,8 @@ android {
         applicationId "com.yieye.xiangqi"
         minSdk 24
         targetSdk 34
-        versionCode 31
-        versionName "0.0.30"
+        versionCode 34
+        versionName "0.0.34"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 

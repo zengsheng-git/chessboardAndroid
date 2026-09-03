@@ -29,9 +29,6 @@ public class EngineHelper {
     public String engineType = "uci";
     public String engineName = "";
     public String engineAuthor = "";
-    public String lastBestMove = "";
-    public String lastPonderMove = "";
-
     // Handshake flags
     private volatile boolean isUciOk = false;
     private volatile boolean isReadyOk = false;
@@ -71,13 +68,10 @@ public class EngineHelper {
     // 对齐桌面端 alt_score_gap：候选分数与最优差 ≤ 该值才列为次优
     private static final int ALT_SCORE_GAP = 300;
 
-    public List<String> optionList = new ArrayList<>();
     public Map<String, String> configs = new HashMap<>();
     
     private volatile String currentFen = "";
     
-    public long lastOutputTime = 0;
-    public String ignoreMove = "";
     public volatile boolean initialized = false;
 
     public native void initJNI(String workDir);
@@ -188,7 +182,6 @@ public class EngineHelper {
     // This method is called from C++
     public void onEngineOutput(String line) {
         if (line == null || line.trim().isEmpty()) return;
-        lastOutputTime = System.currentTimeMillis();
         handleOutputLine(line);
     }
 
@@ -270,7 +263,7 @@ public class EngineHelper {
             }
             this.currentFen = "";
         } else if (cmd.equals("option")) {
-            optionList.add(line);
+            // option 行仅握手期出现，无下游消费，不缓存
         } else if (cmd.equals("id")) {
             if (args.length >= 3) {
                 String type = args[1].toLowerCase();
@@ -289,11 +282,6 @@ public class EngineHelper {
         } else {
             sendCommand("setoption name " + key);
         }
-    }
-
-    public void stopAnalyze() {
-        this.currentFen = "";
-        sendCommand("stop");
     }
 
     public void sendCommand(String cmd) {

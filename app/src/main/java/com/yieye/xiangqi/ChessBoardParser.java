@@ -21,7 +21,7 @@ public class ChessBoardParser {
     // large.onnx 为同一文件（MD5 一致），是桌面端实战验证过的稳定识别模型。
     // 切到 yolov11.onnx 后在腾讯象棋的将军高亮/装饰环下频繁丢子、变异、幻影，
     // 是此前一系列"轮次错报/错误提示"的识别层根源，故回退桌面端方案
-    private static final boolean USE_YOLO_V11 = false;
+    private static final boolean USE_YOLO_V11 = true;
 
     private static ChessDetector cachedDetector;
     private static RectF cachedCropRect = null;

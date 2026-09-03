@@ -80,8 +80,13 @@ public class FloatWindowManager {
     }
 
     public void updateMove(String move) {
+        updateMove((CharSequence) move);
+    }
+
+    /** 支持富文本（Spannable 着色）的更新入口 */
+    public void updateMove(CharSequence text) {
         if (moveTextView != null) {
-            moveTextView.post(() -> moveTextView.setText(move));
+            moveTextView.post(() -> moveTextView.setText(text));
         }
     }
 

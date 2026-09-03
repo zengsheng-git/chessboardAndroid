@@ -20,6 +20,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.text.SpannableStringBuilder;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.WindowManager;
@@ -91,6 +92,10 @@ public class AnalysisService extends Service {
     private int[] lastKnownBlackKing = null;
     private static final String PREFS_KING_MEM = "king_memory";
     private int noBoardCount = 0;             // 连续识别失败计数（无棋子/无棋盘）
+    private String lastResult = "";           // 最近一次成功显示的提示（静默期恢复用）
+    private boolean windowShowsAnalyzing = false; // 悬浮窗当前是否停留在"正在分析"（用于静默期恢复）
+    private int cloudFailStreak = 0;          // 云库连续不可达计数
+    private long cloudCooldownUntil = 0;      // 云库熔断截止时间（elapsedRealtime）
     private long[] lastCroppedHash = null;    // 上一次裁剪图片的感知哈希
     private boolean hasLastCroppedHash = false;
     private long[] pendingPrevHash = null;    // 本次提交前的哈希（噪声帧回滚用）
@@ -171,7 +176,7 @@ public class AnalysisService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         int resultCode = intent.getIntExtra("resultCode", 0);
         Intent resultData = intent.getParcelableExtra("data");
-        calcDepth = intent.getIntExtra("depth", 14);
+        calcDepth = intent.getIntExtra("depth", 20);
 
         if (resultCode != 0 && resultData != null) {
             if (virtualDisplay != null) {
@@ -389,14 +394,36 @@ public class AnalysisService extends Service {
 
         LogUtil.i(TAG, ("w".equals(turn) ? getString(R.string.turn_red) : getString(R.string.turn_black)) + ", start analyze...");
         FloatWindowManager.getInstance(this).updateMove(getString(R.string.analyzing));
+        windowShowsAnalyzing = true;
 
         long startedAt = System.currentTimeMillis();
-        EngineHelper.SearchResult r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+        String source = null;
+        EngineHelper.SearchResult r;
+
+        // ① 云库优先（桌面端 search 语义）：chessdb 命中则秒出招，未命中/网络失败
+        //    落本地引擎；云库判非法（多为识别缺子/错子）则按无效帧跳过
+        ChessDB.Result cloud = queryCloudSafe(f.boardPart + " " + turn, 5);
+        if (ChessDB.STATE_INVALID.equals(cloud.state)) {
+            LogUtil.w(TAG, "云库判定局面非法，跳过本轮等待识别恢复");
+            return;
+        }
+        if (ChessDB.STATE_SUCCESS.equals(cloud.state) && !cloud.pv.isEmpty()) {
+            source = cloud.source;
+            r = new EngineHelper.SearchResult();
+            r.bestMove = cloud.pv.get(0);
+            r.ponderMove = cloud.pv.size() > 1 ? cloud.pv.get(1) : null;
+            r.score = cloud.score;
+            r.depth = cloud.depth;
+        } else {
+            source = "引擎";
+            r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+        }
         long engineTime = System.currentTimeMillis() - startedAt;
 
         if (r != null && "(none)".equals(r.bestMove)) {
             // 行棋方无合法着法（被将死/困毙）：如实提示，避免悬浮窗停在"正在分析"
             LogUtil.i(TAG, "该局面已无棋可走（将死/困毙）");
+            windowShowsAnalyzing = false;
             FloatWindowManager.getInstance(this).updateMove("已无棋可走（将死/困毙）");
             return;
         }
@@ -431,16 +458,101 @@ public class AnalysisService extends Service {
                 ? Utils.fenToChina(this, finalFen, r.ponderMove, f.bottomIsRed) : getString(R.string.none_ponder);
 
         String turnStr = finalFen.contains(" w ") ? getString(R.string.turn_red) : getString(R.string.turn_black);
-        String displayStr = turnStr + "\n" +
-                getString(R.string.recommend) + chinaMove + " (" + r.bestMove + ") + " + getString(R.string.time_consumed) + engineTime / 100 / 10f + "s\n" +
-                getString(R.string.ponder) + chinaMove2 + " (" + (r.ponderMove != null ? r.ponderMove : "none") + ")";
+
+        // ③ 次优候选（仅本地引擎 MultiPV 提供）：分数与最优差 ≤ alt_score_gap 的名次首着，
+        //    括号内为与最优的相对分数（负值 = 比最优差多少），供直观判断候选质量
+        StringBuilder altTextSb = new StringBuilder();
+        if (r.alternatives != null) {
+            for (EngineHelper.AltCandidate a : r.alternatives) {
+                if (altTextSb.length() > 0) altTextSb.append("  ");
+                altTextSb.append(Utils.fenToChina(this, finalFen, a.move, f.bottomIsRed))
+                         .append("(").append(a.relScore).append(")");
+            }
+        }
+        String altText = altTextSb.toString();
+        String evalText = formatEval(r.score);
+
+        // 悬浮窗富文本（配色对齐桌面端 Analyse.vue）：
+        // 推荐招法=蓝(info) 深度=橙(warning) 备选招法=紫(#9b59b6) 形势=优绿/劣红 均势灰
+        // 不显示括号内的 iccs 坐标编码（如 g7e6）——用户看的是中文记谱
+        SpannableStringBuilder display = new SpannableStringBuilder();
+        appendColored(display, turnStr + "\n", 0xFFFFFFFF, true);
+        appendColored(display, getString(R.string.recommend), 0xFFB0B0B0, false);
+        appendColored(display, chinaMove, 0xFF2080F0, true);
+        if (source != null) appendColored(display, " [" + source + "]", 0xFF9B59B6, false);
+        appendColored(display, " + " + getString(R.string.time_consumed) + engineTime / 100 / 10f + "s\n", 0xFFB0B0B0, false);
+        appendColored(display, getString(R.string.ponder) + chinaMove2 + "\n", 0xFFB0B0B0, false);
+        if (altText.length() > 0) {
+            appendColored(display, "备选: ", 0xFFB0B0B0, false);
+            appendColored(display, altText + "\n", 0xFF9B59B6, true);
+        }
+        if (r.score != Integer.MIN_VALUE) {
+            int evalColor = r.score > 30 ? 0xFF18A058 : r.score < -30 ? 0xFFD03050 : 0xFFB0B0B0;
+            appendColored(display, "形势: ", 0xFFB0B0B0, false);
+            appendColored(display, evalText, evalColor, true);
+            appendColored(display, "  深度: " + r.depth + "\n", 0xFFF0A020, false);
+        }
+
+        String displayStr = display.toString();
         LogUtil.d(TAG, getString(R.string.log_best_move, engineTime, displayStr));
 
-        FloatWindowManager.getInstance(this).updateMove(displayStr);
+        // 悬浮窗更新必须用富文本对象 display（SpannableStringBuilder），
+        // 传 toString() 会丢弃全部颜色 span（纯文本覆写悬浮窗）
+        lastResult = displayStr;
+        windowShowsAnalyzing = false;
+        FloatWindowManager.getInstance(this).updateMove(display);
 
         Intent intentBroadcast = new Intent("com.example.CHESS_RESULT");
         intentBroadcast.putExtra("displayStr", displayStr);
         sendBroadcast(intentBroadcast);
+    }
+
+    /** 云库查询（带熔断）：连续 2 次不可达则 5 分钟内直接走本地引擎，避免离线时每步白等 */
+    private ChessDB.Result queryCloudSafe(String fen, int timeoutSec) {
+        long now = SystemClock.elapsedRealtime();
+        if (now < cloudCooldownUntil) {
+            return new ChessDB.Result();   // unknown → 本地引擎
+        }
+        ChessDB.Result r = ChessDB.query(fen, timeoutSec);
+        if (ChessDB.STATE_UNKNOWN.equals(r.state)) {
+            cloudFailStreak++;
+            if (cloudFailStreak >= 2) {
+                cloudFailStreak = 0;
+                cloudCooldownUntil = now + 300_000;
+                LogUtil.w(TAG, "云库连续不可达，5 分钟内直接走本地引擎");
+            }
+        } else {
+            cloudFailStreak = 0;
+        }
+        return r;
+    }
+
+    /** 追加一段带颜色/粗体的富文本 */
+    private void appendColored(SpannableStringBuilder b, String text, int color, boolean bold) {
+        int start = b.length();
+        b.append(text);
+        b.setSpan(new android.text.style.ForegroundColorSpan(color), start, b.length(),
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        if (bold) {
+            b.setSpan(new android.text.style.StyleSpan(android.graphics.Typeface.BOLD), start, b.length(),
+                    android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+    }
+
+    /**
+     * 局面评估翻译（对齐桌面端 Analyse.vue 的 formatEval，行棋方视角）：
+     * ±29000 以上为将杀步数编码，|分数|<30 为均势，其余按差值分四档优劣。
+     */
+    private String formatEval(int score) {
+        int abs = Math.abs(score);
+        if (score >= 29000) return (30000 - score) + "步杀";
+        if (score <= -30001) return (-score - 30000) + "步被杀";
+        if (score <= -29000) return (30000 + score) + "步被杀";
+        if (abs < 30) return "均势";
+        String[] gradePos = {"略优", "较优", "大优", "胜势"};
+        String[] gradeNeg = {"略差", "较差", "大差", "败势"};
+        int idx = abs < 150 ? 0 : abs < 400 ? 1 : abs < 800 ? 2 : 3;
+        return (score > 0 ? "+" + abs : "-" + abs) + " " + (score > 0 ? gradePos[idx] : gradeNeg[idx]);
     }
 
     /**
@@ -479,6 +591,15 @@ public class AnalysisService extends Service {
                 long[] croppedHash = computePHash(cropped);
                 if (prevHas && hammingDistance(croppedHash, prevHash) <= PHASH_THRESHOLD) {
                     lastCroppedHash = croppedHash;
+                    // 画面未变化。若悬浮窗还停留在"正在分析"（上一次分析无果被丢弃，
+                    // 且画面已回到锚定位置外观），恢复上一条有效提示，
+                    // 避免假的分析状态长期挂屏、让用户误以为仍在计算
+                    if (windowShowsAnalyzing) {
+                        windowShowsAnalyzing = false;
+                        if (lastResult != null && !lastResult.isEmpty()) {
+                            FloatWindowManager.getInstance(this).updateMove(lastResult);
+                        }
+                    }
                     return null; // 画面未变化，等下一拍
                 }
                 lastCroppedHash = croppedHash;
@@ -559,7 +680,8 @@ public class AnalysisService extends Service {
 
         // 有锚定基线：先校验"王以外的部分恰好是一步干净棋"（说明对方走的是别的子、
         // 王只是被高亮挡住），才从基线补回。若王以外的部分无变化，说明对方走的就是王
-        // （逃将后的新位置同样识别不到）——补回旧位置等于对幻影局面出招，宁缺毋滥
+        // （逃将后的新位置同样识别不到）——此时落到下方王位记忆兜底
+        int[] memSpot = "r_jiang".equals(missing) ? lastKnownRedKing : lastKnownBlackKing;
         if (lastBoard != null) {
             int same = 0;
             for (int y = 0; y < 10; y++)
@@ -575,34 +697,26 @@ public class AnalysisService extends Service {
             String[][] fNoKing = cloneBoard(f.board);
             removeKing(fNoKing, missing);
             DiffResult d = boardDiff(lbNoKing, fNoKing);
-            if (d.kind != DiffResult.MOVE) {
-                LogUtil.i(TAG, "将/帅被高亮遮挡且疑似已移动，跳过本轮分析等待识别恢复");
-                f.degraded = true;
-                return f;
-            }
-            if (restoreKing(f.board, lastBoard, missing)) {
+            if (d.kind == DiffResult.MOVE && restoreKing(f.board, lastBoard, missing)) {
                 f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
                 f.boardPart = f.fen.split(" ")[0];
                 LogUtil.i(TAG, "识别丢失将/帅（对方走的是其他子），已从上一局面补回: " + f.boardPart);
                 return f;
             }
-            f.degraded = true;
-            return f;
         }
 
-        // 无锚定基线（INITIAL/重置后）：按跨重锚定、跨会话的王位记忆补回——
-        // 将/帅离不开九宫，记忆位为空就按记忆补回，远好于永远"等待识别"
-        int[] mem = "r_jiang".equals(missing) ? lastKnownRedKing : lastKnownBlackKing;
-        if (mem != null && f.board[mem[0]][mem[1]] == null) {
-            f.board[mem[0]][mem[1]] = missing;
+        // 王位记忆兜底（对齐桌面端场景：基线缺王/噪声帧时也能恢复分析）：
+        // 将/帅离不开九宫，记忆位在当前帧为空即可按记忆补回
+        if (memSpot != null && f.board[memSpot[0]][memSpot[1]] == null) {
+            f.board[memSpot[0]][memSpot[1]] = missing;
             f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
             f.boardPart = f.fen.split(" ")[0];
-            LogUtil.i(TAG, "识别丢失将/帅，按记忆位置(" + mem[0] + "," + mem[1] + ")补回: " + f.boardPart);
+            LogUtil.i(TAG, "识别丢失将/帅，按王位记忆(" + memSpot[0] + "," + memSpot[1] + ")补回: " + f.boardPart);
             return f;
         }
 
-        // 无王位记忆或记忆位被占：跳过本轮，等某一帧识别出王后重建记忆
-        LogUtil.i(TAG, "将/帅不可见且无王位记忆，跳过本轮分析等待识别恢复");
+        // 记忆位被占或无记忆（王真的移动了且新位置也未识别出）：识别噪声，不分析不锚定
+        LogUtil.i(TAG, "将/帅不可见且无法可靠补回，跳过本轮分析等待识别恢复");
         f.degraded = true;
         return f;
     }

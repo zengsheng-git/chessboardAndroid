@@ -32,8 +32,17 @@ public class YoloV11Detector implements ChessDetector {
     private final OrtSession session;
 
     private static final int INPUT_SIZE = 640;
-    private static final float CONF_THRESHOLD = 0.5f;
+    // 0.35：腾讯象棋的将军高亮/装饰环会压低棋子置信度，0.5 会随机丢子；
+    // 低于门槛的幻影检测由 CLASS_LIMITS 与 AnalysisService 的帧级守卫兜底
+    private static final float CONF_THRESHOLD = 0.35f;
     private static final float NMS_THRESHOLD = 0.45f;
+    // 对齐桌面端 yolo.rs 的 LIMIT：每类棋子数量上限，超出只保留得分最高的——
+    // 高亮/装饰环被误检成棋子时在此被结构性过滤
+    private static final int[] CLASS_LIMITS = {
+            2, 2, 2, 1, 2, 2, 5,   // b_ma b_xiang b_shi b_jiang b_che b_pao b_bing
+            2, 2, 2, 1, 2, 2, 5,   // r_che r_ma r_shi r_jiang r_xiang r_pao r_bing
+            1                      // board
+    };
     private static final int NUM_CLASSES = YoloV5Detector.LABELS.length;
 
     public YoloV11Detector(Context context, String modelPath) throws Exception {
@@ -150,8 +159,11 @@ public class YoloV11Detector implements ChessDetector {
                 if (box.labelId == labelId) pq.add(box);
             }
 
+            int kept = 0;   // 每类保留数量上限（桌面端 LIMIT 语义）
             while (!pq.isEmpty()) {
                 YoloResult best = pq.poll();
+                if (kept >= CLASS_LIMITS[labelId]) break;
+                kept++;
                 results.add(best);
 
                 List<YoloResult> remaining = new ArrayList<>(pq);

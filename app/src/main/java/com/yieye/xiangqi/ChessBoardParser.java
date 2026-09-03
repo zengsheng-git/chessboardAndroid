@@ -17,11 +17,22 @@ public class ChessBoardParser {
         void onResult(String fen, List<YoloResult> results);
     }
 
-    // true = 使用 YOLOv11 (yolov11.onnx)；false = 使用 YOLOv5 (middle.onnx)
-    private static final boolean USE_YOLO_V11 = true;
+    // false = 使用 middle.onnx + YoloV5Detector——middle.onnx 与桌面端 chessboard 的
+    // large.onnx 为同一文件（MD5 一致），是桌面端实战验证过的稳定识别模型。
+    // 切到 yolov11.onnx 后在腾讯象棋的将军高亮/装饰环下频繁丢子、变异、幻影，
+    // 是此前一系列"轮次错报/错误提示"的识别层根源，故回退桌面端方案
+    private static final boolean USE_YOLO_V11 = false;
 
     private static ChessDetector cachedDetector;
     private static RectF cachedCropRect = null;
+
+    /**
+     * 丢弃缓存的检测器会话（看门狗在推理挂死时调用）。旧的 OrtSession 由 GC 兜底回收，
+     * 下一次 getDetector 会创建全新会话。若旧会话仍卡在 native 调用里，只能随其自灭。
+     */
+    public static synchronized void resetDetector() {
+        cachedDetector = null;
+    }
 
     private static synchronized ChessDetector getDetector(Context context) throws Exception {
         if (cachedDetector == null) {
@@ -233,6 +244,10 @@ public class ChessBoardParser {
         String[][] grid = new String[9][10];
         boolean redSide = true; // 默认红方在下
 
+        // 低置信度的将/帅（被将军高亮/装饰环拉低分数）：不参与主分配，
+        // 循环结束后仅在九宫格内且格位为空时补上，且同侧只补一颗
+        List<YoloResult> lowConfKings = new ArrayList<>();
+
         for (YoloResult res : validPieces) {
             float cx = res.rect.centerX();
             float cy = res.rect.centerY();
@@ -243,9 +258,17 @@ public class ChessBoardParser {
             int xPos = Math.round(offsetX / gridWidth);
             int yPos = Math.round(offsetY / gridHeight);
 
+            boolean isKing = res.labelName.equals("b_jiang") || res.labelName.equals("r_jiang");
+            if (isKing && res.score < YoloV5Detector.CONF_THRESHOLD) {
+                if (xPos >= 0 && xPos <= 8 && yPos >= 0 && yPos <= 9) {
+                    lowConfKings.add(res);
+                }
+                continue;
+            }
+
             if (xPos >= 0 && xPos <= 8 && yPos >= 0 && yPos <= 9) {
                 grid[xPos][yPos] = res.labelName;
-                
+
                 // 自动识别红黑方 (C# 逻辑: 如果帅在上方 y < 5，则 RedSide 为 false)
                 if (res.labelName.equals("r_jiang")) {
                     if (yPos < 5) {
@@ -254,6 +277,32 @@ public class ChessBoardParser {
                         redSide = true;
                     }
                 }
+            }
+        }
+
+        // 补低置信度的将/帅：仅接受落在九宫格内、格位为空、且同侧尚无王的位置
+        for (YoloResult res : lowConfKings) {
+            float cx = res.rect.centerX();
+            float cy = res.rect.centerY();
+            int xPos = Math.round((cx - boardRect.left) / gridWidth);
+            int yPos = Math.round((cy - boardRect.top) / gridHeight);
+            boolean inPalace = xPos >= 3 && xPos <= 5 && (yPos <= 2 || yPos >= 7);
+            if (!inPalace || grid[xPos][yPos] != null) continue;
+
+            String sidePrefix = res.labelName.substring(0, 1);
+            boolean sameSideKingExists = false;
+            for (int y = 0; y < 10 && !sameSideKingExists; y++) {
+                for (int x = 0; x < 9 && !sameSideKingExists; x++) {
+                    sameSideKingExists = grid[x][y] != null
+                            && grid[x][y].startsWith(sidePrefix + "_")
+                            && grid[x][y].endsWith("jiang");
+                }
+            }
+            if (sameSideKingExists) continue;
+
+            grid[xPos][yPos] = res.labelName;
+            if (res.labelName.equals("r_jiang")) {
+                redSide = yPos >= 7;
             }
         }
 

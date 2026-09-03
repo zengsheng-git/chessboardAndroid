@@ -18,6 +18,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -28,46 +29,99 @@ import androidx.core.app.NotificationCompat;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 
+/**
+ * 完全对齐桌面端 chessboard 原型（server/src/worker.rs）的单线程同步架构：
+ *
+ *   loop { 等待间隔 → 截屏识别 → 状态机分类 → （需要时）阻塞式引擎搜索 → 显示/更新预期 }
+ *
+ * 引擎搜索是阻塞调用（EngineHelper.searchSync：发出 go 后等 bestmove 才返回），并且与
+ * 截屏在同一条线程上串行执行。因此"引擎思考期间不可能发起第二次分析"、"悬浮窗显示
+ * 过期提示"这类异步竞态在结构上不存在：搜索返回后下一拍立即截取最新画面重新分类，
+ * 对手毫秒级跟走也会被下一拍正常捕获。
+ *
+ * 旧版方案（异步 bestmove 回调 + isAnalyzing 标志门控截屏 + 18s 看门狗）在红黑快速
+ * 连走的场景下反复出现并发分析/提示过期/永挂问题，整套机制随本次重构移除。
+ */
 public class AnalysisService extends Service {
     private static final String TAG = "AnalysisService";
     private static final String CHANNEL_ID = "AnalysisChannel";
 
+    // 桌面端 timer_interval=200ms；Android 单拍含截屏+哈希开销更大，取 300ms 兼顾反应速度与功耗
+    private static final long LOOP_INTERVAL_MS = 300;
+    private static final long CONFIRM_INTERVAL_MS = 200;    // 桌面端 confirm_interval
+    private static final double ENGINE_STEP_TIME_SEC = 5.0; // Windows EngineStepTime
+    private static final int NO_BOARD_RESET_THRESHOLD = 3;  // 连续识别失败后重置棋盘定位缓存
+    private static final int PHASH_SIZE = 32;
+    private static final int PHASH_THRESHOLD = 2;
+    // 标准开局 FEN（parser 输出的棋盘段恒为"红在下"的标准方向，可直接字符串比较）
+    private static final String STARTPOS_BOARD = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C4/9/RNBAKABNR";
+
+    /** 桌面端 ChessboardState：StartPos 并入 GENERIC（后续行为一致，仅首次启发式行棋方不同） */
+    private enum ChessboardState { INITIAL, GENERIC, INVALID }
+
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    // 分析循环整体跑在独立的 HandlerThread 上（参考 chessboard 原型的单线程循环），
-    // 识别/确认/启动分析串行执行，主线程只负责服务生命周期，不再被推理阻塞
     private HandlerThread analysisThread;
     private Handler handler;
     private WindowManager windowManager;
     private int screenWidth, screenHeight, screenDensity;
 
-    private String lastFen = "";
-    private String lastResult = "";
-    private String[][] lastBoardArray = null;
-    private String nextTurn = "w";
-    private volatile String mySide = null; // 屏幕底部方颜色，由识别帧更新，JNI 回调线程读取
     private EngineHelper engineHelper;
-    private boolean isRunning = false;
-    private volatile boolean isAnalyzing = false;
-    private volatile long lastAnalyzeStartTime = 0;
-    // 预期棋盘（参考 chessboard 的 expect_board）：分析完成后用 bestMove 推演出的局面，
-    // 对手按预期走子时直接命中 → 行棋方零猜测，且免去稳定确认的等待
-    private volatile String expectBoardFen = null;
-    private volatile String expectNextTurn = null;
-    private long[] lastCroppedHash = null; // 上一次裁剪图片的感知哈希
-    private boolean hasLastCroppedHash = false;
-    private int noBoardCount = 0; // 连续识别失败计数（无棋子/无棋盘）
-    private static final int NO_BOARD_RESET_THRESHOLD = 3; // 连续失败达到该值后重置棋盘定位缓存
-    private static final int PHASH_SIZE = 32; // 感知哈希采样网格 32x32 = 1024 bit
-    private static final int PHASH_THRESHOLD = 2; // 汉明距离阈值，小于等于此值认为相同
+    private volatile boolean isRunning = false;
     private int calcDepth = 14;
-    private static final long CONFIRM_INTERVAL_MS = 200; // 局面稳定确认的复抓间隔 (Windows: confirm_interval)
-    private static final long RELEASE_DELAY_MS = 200; // 分析结果回调后解锁下一轮分析的延迟
 
-    private volatile boolean stopTriggeredForCurrentAnalysis = false;
-    private static final int STOP_SCORE = 2000; // 分数超过该阈值提前终止搜索 (Windows: StopScore)
-    private static final double ENGINE_STEP_TIME_SEC = 5.0; // 每步引擎最长思考时间 (Windows: EngineStepTime)
+    // 引擎进程级单例（对齐桌面端 SHARED_STATE/OnceLock 语义）：native 层的输出回调是
+    // 全局注册的，若每个 Service 实例新建 EngineHelper，重开会话后 bestmove 会回给
+    // 已销毁的旧实例——新会话的搜索永远超时。引擎只创建一次，跨会话复用
+    private static EngineHelper sEngineHelper;
+
+    // 分析上下文（桌面端 AnalysisContext）
+    private ChessboardState state = ChessboardState.INITIAL;
+    private String[][] lastBoard = null;      // 上一次分析的棋盘（归一化红在下）
+    private String lastBoardPart = null;      // 对应的 FEN 棋盘段
+    private String expectBoardFen = null;     // 预期棋盘（bestMove 走完后）的 FEN 棋盘段
+    private String expectNextTurn = null;     // 预期棋盘的行棋方
+    private String nextTurn = "w";            // 上一次分析局面的行棋方（奇偶合并帧推断用）
+    private int invalidChangeCount = 0;       // 桌面端 invalid_change_count
+    private int untrustedCount = 0;           // 连续不可信帧（幻影/王不可见）计数
+    // 最近一次有效识别的将/帅位置 {x,y}。跨重锚定/跨会话保留（SharedPreferences）：
+    // 将军高亮会让 YOLO 持续丢识别王，而缺王局面无法分析，王位记忆是唯一可靠修复来源
+    private int[] lastKnownRedKing = null;
+    private int[] lastKnownBlackKing = null;
+    private static final String PREFS_KING_MEM = "king_memory";
+    private int noBoardCount = 0;             // 连续识别失败计数（无棋子/无棋盘）
+    private long[] lastCroppedHash = null;    // 上一次裁剪图片的感知哈希
+    private boolean hasLastCroppedHash = false;
+    private long[] pendingPrevHash = null;    // 本次提交前的哈希（噪声帧回滚用）
+    private boolean pendingPrevHas = false;
+
+    /** 回滚最近一次 pHash 提交：下一拍将重新识别同一画面（噪声帧重试用） */
+    private void rollbackPHash() {
+        if (pendingPrevHas) {
+            lastCroppedHash = pendingPrevHash;
+            hasLastCroppedHash = pendingPrevHas;
+        }
+    }
+
+    /** 一帧识别结果 */
+    private static class Frame {
+        String fen;          // 完整 FEN（第二段 = 屏幕底部方）
+        String boardPart;    // FEN 棋盘段（恒为红在下标准方向）
+        String[][] board;    // 归一化棋盘数组（供逐格 diff）
+        boolean bottomIsRed;
+        boolean degraded;    // 将/帅不可见且无法安全补回：本轮不分析不锚定
+    }
+
+    /** 桌面端 board_diff 分类结果（丢王修复的"王外着法"分类用） */
+    private static class DiffResult {
+        static final int ONE = 0;      // 单格变化
+        static final int MOVE = 1;     // 正常一步棋（一空一占成对）
+        static final int UNKNOWN = 2;  // 多格未知变化
+        int kind;
+        String moverCamp;              // MOVE 时有效："w"/"b"
+        String fromPiece;              // 消失格原子
+    }
 
     @Override
     public void onCreate() {
@@ -89,68 +143,25 @@ public class AnalysisService extends Service {
         analysisThread.start();
         handler = new Handler(analysisThread.getLooper());
 
-        engineHelper = new EngineHelper(this, new HashMap<>());
-        engineHelper.bestMoveEvent = (sourceFen, bestMove, ponderMove) -> {
-            long engineTime = System.currentTimeMillis() - lastAnalyzeStartTime;
-            if (sourceFen != null && !sourceFen.isEmpty()) {
-                // 生成预期棋盘：bestMove 走完后的局面 + 轮到对方。
-                // 对手照着走时下一帧直接命中，行棋方无需再从画面 diff 推导
-                String expectFen = Utils.applyMoveToFen(sourceFen, bestMove);
-                if (expectFen != null && expectFen.contains(" ")) {
-                    expectBoardFen = expectFen.split(" ")[0];
-                    expectNextTurn = expectFen.split(" ")[1];
-                } else {
-                    expectBoardFen = null;
-                    expectNextTurn = null;
-                }
+        if (sEngineHelper == null) {
+            sEngineHelper = new EngineHelper(getApplicationContext(), new HashMap<>());
+        }
+        engineHelper = sEngineHelper;
+        // 注意：桌面端原型没有"分数够大/绝杀就提前 stop"的逻辑，实测本工程的 JNI 层
+        // Pikafish 收到 stop 后再也不返回 bestmove（搜索直接卡死到超时），
+        // 因此这里绝不能注册 infoEvent 提前终止，一切搜索都等 movetime 自然结束。
+        // 引擎为进程级单例，仅在未完成握手时 init（重复 init 会触发 uciok 超时与回调错位）；
+        // 若上次初始化失败，这里会重试握手，自愈失败的单例
+        if (!engineHelper.initialized) {
+            engineHelper.init();
+        }
 
-                // 记谱需要"屏幕底部方"视角（不是行棋方），否则黑方行棋时中文记谱错位
-                boolean bottomIsRed = (mySide == null) || mySide.equals("w");
-                String chinaMove = (bestMove != null && bestMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, bestMove, bottomIsRed) : getString(R.string.unknown);
-                String chinaMove2 = (ponderMove != null && ponderMove.length() >= 4) ? Utils.fenToChina(this, sourceFen, ponderMove, bottomIsRed) : getString(R.string.none_ponder);
-
-                String turnStr = sourceFen.contains(" w ") ? getString(R.string.turn_red) : getString(R.string.turn_black);
-                String displayStr = turnStr + "\n" +
-                        getString(R.string.recommend) + chinaMove + " (" + (bestMove != null ? bestMove : "none") + ") + " + getString(R.string.time_consumed) + engineTime/100/10f + "s\n" +
-                        getString(R.string.ponder) + chinaMove2 + " (" + (ponderMove != null ? ponderMove : "none") + ")";
-                LogUtil.d(TAG, getString(R.string.log_best_move, engineTime, displayStr));
-
-                lastResult = displayStr;
-                // 1. 更新悬浮窗
-                FloatWindowManager.getInstance(this).updateMove(displayStr);
-
-                // 2. 发送广播给 Activity
-                Intent intentBroadcast = new Intent("com.example.CHESS_RESULT");
-                intentBroadcast.putExtra("displayStr", displayStr);
-                sendBroadcast(intentBroadcast);
-            }
-            // 短暂延迟后再允许下一次分析，给 UI 留出反应时间并降低功耗
-            handler.postDelayed(() -> isAnalyzing = false, RELEASE_DELAY_MS);
-        };
-        engineHelper.infoEvent = (cmd, infos) -> {
-            // 对齐 Windows StopScore/StopWhenMate：一旦分数已经足够大或已经出现绝杀，
-            // 不必再等满深度/满时间，直接提前终止搜索并使用当前的 pv 作为结果。
-            // 注意：score 键在 "score mate N" 时存的是本地化字符串（parseInt 会抛异常被吞掉，无害），
-            // mate 的步数在独立的 "mate" 键里，始终是纯数字。
-            if (stopTriggeredForCurrentAnalysis) return;
-            try {
-                if (infos.containsKey("mate")) {
-                    if (Integer.parseInt(infos.get("mate")) > 0) {
-                        stopTriggeredForCurrentAnalysis = true;
-                        LogUtil.i(TAG, "检测到必胜的绝杀，提前终止搜索");
-                        engineHelper.sendCommand("stop");
-                    }
-                } else if (infos.containsKey("score")) {
-                    if (Integer.parseInt(infos.get("score")) > STOP_SCORE) {
-                        stopTriggeredForCurrentAnalysis = true;
-                        LogUtil.i(TAG, "分数已超过 " + STOP_SCORE + "，提前终止搜索");
-                        engineHelper.sendCommand("stop");
-                    }
-                }
-            } catch (NumberFormatException ignored) {
-            }
-        };
-        engineHelper.init();
+        // 加载跨会话的王位记忆（将军高亮导致 YOLO 持续丢王时的修复参照）
+        android.content.SharedPreferences kingMem = getSharedPreferences(PREFS_KING_MEM, Context.MODE_PRIVATE);
+        if (kingMem.getBoolean("red_set", false))
+            lastKnownRedKing = new int[]{kingMem.getInt("red_x", 3), kingMem.getInt("red_y", 9)};
+        if (kingMem.getBoolean("black_set", false))
+            lastKnownBlackKing = new int[]{kingMem.getInt("black_x", 4), kingMem.getInt("black_y", 0)};
 
         // 显示悬浮窗
         FloatWindowManager.getInstance(this).show();
@@ -171,7 +182,9 @@ public class AnalysisService extends Service {
             MediaProjectionManager projectionManager = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
             mediaProjection = projectionManager.getMediaProjection(resultCode, resultData);
             if (mediaProjection != null) {
-                // Android 14 强制要求必须先注册 Callback 才能创建 VirtualDisplay
+                // Android 14 强制要求必须先注册 Callback 才能创建 VirtualDisplay。
+                // 回调必须挂在主线程：分析线程的 Looper 被阻塞式分析循环长期占用，
+                // 注册到它上面 onStop 永远得不到派发
                 mediaProjection.registerCallback(new MediaProjection.Callback() {
                     @Override
                     public void onStop() {
@@ -179,7 +192,7 @@ public class AnalysisService extends Service {
                         isRunning = false;
                         if (virtualDisplay != null) virtualDisplay.release();
                     }
-                }, handler);
+                }, new Handler(Looper.getMainLooper()));
                 startCaptureLoop();
             }
         }
@@ -194,157 +207,467 @@ public class AnalysisService extends Service {
                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                 imageReader.getSurface(), null, null);
 
-        handler.post(captureRunnable);
+        // 整个分析循环就是这一条阻塞 while，跑在分析线程上
+        handler.post(this::loopForever);
+        // 看门狗：native 推理（ONNX session.run）偶发永久挂死，循环会无声卡住。
+        // 超时未心跳则 dump 全线程堆栈定位卡点，并重建检测器、换新线程继续分析
+        Thread watchdog = new Thread(this::watchdogLoop, "YiEyeWatchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
-    private Runnable captureRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (!isRunning) return;
-            // 先调度下一拍，保证节拍固定；分析线程串行执行，本拍耗时会自然顺延下一拍
-            handler.postDelayed(this, 2000); // 每 2 秒截屏一次，pHash 会跳过未变化的帧，兼顾速度与功耗
+    private volatile long lastLoopHeartbeat = 0;
+    private volatile int loopGeneration = 0;
+    private static final long HEARTBEAT_TIMEOUT_MS = 30000;
 
-            if (isAnalyzing) {
-                // 功耗优化：缩短超时检查，防止后台持续高能耗
-                if (System.currentTimeMillis() - lastAnalyzeStartTime > 18000) {
-                    LogUtil.w(TAG, getString(R.string.log_analyze_timeout));
-                    isAnalyzing = false;
-                }
-                return;
-            }
-
+    private void loopForever() {
+        final int generation = loopGeneration;
+        LogUtil.i(TAG, "分析循环启动 (gen=" + generation + ", thread=" + Thread.currentThread().getName() + ")");
+        while (isRunning && generation == loopGeneration) {
+            lastLoopHeartbeat = SystemClock.elapsedRealtime();
+            long started = SystemClock.elapsedRealtime();
             try {
-                captureAndAnalyze();
-            } catch (Exception e) {
-                LogUtil.e(TAG, "Capture error", e);
-                isAnalyzing = false;
+                step();
+            } catch (Throwable t) {
+                // Throwable：连 OutOfMemoryError 也不放过，循环绝不静默死亡
+                LogUtil.e(TAG, "分析循环异常", t);
             }
+            long cost = SystemClock.elapsedRealtime() - started;
+            SystemClock.sleep(Math.max(50, LOOP_INTERVAL_MS - cost));
         }
-    };
-
-    /**
-     * 从 ImageReader 取整屏帧，转成 Bitmap。调用方负责 recycle。
-     */
-    private Bitmap captureScreen() {
-        Image image = imageReader.acquireLatestImage();
-        if (image == null) return null;
-        try {
-            Image.Plane[] planes = image.getPlanes();
-            ByteBuffer buffer = planes[0].getBuffer();
-            int pixelStride = planes[0].getPixelStride();
-            int rowStride = planes[0].getRowStride();
-            int rowPadding = rowStride - pixelStride * screenWidth;
-            Bitmap bitmap = Bitmap.createBitmap(screenWidth + rowPadding / pixelStride, screenHeight, Bitmap.Config.ARGB_8888);
-            bitmap.copyPixelsFromBuffer(buffer);
-            return bitmap;
-        } finally {
-            image.close();
-        }
+        LogUtil.i(TAG, "分析循环退出 (gen=" + generation + ")");
     }
 
-    /**
-     * 对裁剪图做棋子识别并返回 FEN。ChessBoardParser.parse 内部会回收传入的 bitmap。
-     */
-    private String parseCropped(Bitmap cropped) {
-        final String[] out = {null};
-        ChessBoardParser.parse(this, cropped, (fen, results) -> out[0] = fen);
-        return out[0];
-    }
+    private void watchdogLoop() {
+        while (isRunning) {
+            SystemClock.sleep(3000);
+            if (!isRunning) break;
+            long idle = SystemClock.elapsedRealtime() - lastLoopHeartbeat;
+            if (idle < HEARTBEAT_TIMEOUT_MS) continue;
 
-    /**
-     * 稳定确认的复抓：截屏 → smartCrop → 识别（跳过 pHash，确认帧明确要识别）
-     */
-    private String captureAndParseOnce() {
-        Bitmap full = captureScreen();
-        if (full == null) return null;
-        try {
-            Bitmap cropped = ChessBoardParser.smartCrop(this, full);
-            if (cropped == null) return null;
-            return parseCropped(cropped);
-        } finally {
-            full.recycle();
-        }
-    }
-
-    private void captureAndAnalyze() {
-        long startTime = System.currentTimeMillis();
-        Bitmap bitmap = captureScreen();
-        if (bitmap == null) return;
-
-        try {
-            long captureTime = System.currentTimeMillis() - startTime;
-
-            // 智能裁剪棋盘（有缓存时仅做矩形裁剪，跳过 YOLO）
-            long detectStart = System.currentTimeMillis();
-            Bitmap cropped = ChessBoardParser.smartCrop(this, bitmap);
-            long detectTime = System.currentTimeMillis() - detectStart;
-
-            if (cropped == null) {
-                LogUtil.d(TAG, getString(R.string.log_no_board_found, captureTime, detectTime));
-                onNoBoard();
-                return;
+            LogUtil.e(TAG, "分析循环 " + (idle / 1000) + "s 无心跳，疑似 native 推理挂死，dump 线程堆栈并重建");
+            for (java.util.Map.Entry<Thread, StackTraceElement[]> e : Thread.getAllStackTraces().entrySet()) {
+                String name = e.getKey().getName();
+                if (name.contains("YiEye") || name.contains("OrtInference") || name.contains("ort")) {
+                    StringBuilder sb = new StringBuilder("Thread " + name + ":\n");
+                    for (StackTraceElement el : e.getValue()) sb.append("  at ").append(el).append("\n");
+                    LogUtil.e(TAG, sb.toString());
+                }
             }
+            // 丢弃可能已挂死的检测器会话，换新线程新会话继续；旧线程若从 native 返回，
+            // 会因 generation 不匹配自动退出
+            ChessBoardParser.resetDetector();
+            loopGeneration++;
+            analysisThread.quitSafely();
+            analysisThread = new HandlerThread("YiEyeAnalysis");
+            analysisThread.start();
+            handler = new Handler(analysisThread.getLooper());
+            handler.post(this::loopForever);
+        }
+    }
 
-            // 感知哈希对比：如果裁剪后的图片与上一次相同，跳过后续识别
-            long[] croppedHash = computePHash(cropped);
-            if (hasLastCroppedHash) {
-                int dist = hammingDistance(croppedHash, lastCroppedHash);
-                LogUtil.d(TAG, "感知哈希差异: " + dist);
-                if (dist <= PHASH_THRESHOLD) {
-                    lastCroppedHash = croppedHash;
+    /** 一拍：截屏识别 → 状态机分类 → 需要时阻塞分析（桌面端循环主体） */
+    private void step() {
+        // INITIAL 状态（首次/重置后重新锚定）必须强制识别：进入 INITIAL 时画面往往
+        // 与上一拍相同，pHash 去重会把这一拍吞掉，导致永远停在 INITIAL 不分析
+        Frame f = captureFrame(state == ChessboardState.INITIAL);
+        if (f == null) {
+            // 无棋盘 / 画面未变化：等下一拍（桌面端 continue）
+            return;
+        }
+        if (f.degraded) {
+            // 将/帅被高亮遮挡且疑似已移动：保留悬浮窗旧提示，不锚定坏帧，等识别恢复
+            return;
+        }
+
+        switch (state) {
+            case INITIAL: {
+                // 非法局面（缺王/棋子超限，常见于复盘标号遮挡、切页动画帧）不能作为锚定
+                // 基线：不锚定、保持 INITIAL 等下一拍重试。否则状态机会冻结在坏帧上，
+                // 悬浮窗永远停在"等待识别"且后续所有帧都因对比基线是坏帧而无法恢复
+                if (!engineHelper.isValidFen(f.fen)) {
+                    LogUtil.w(TAG, "INITIAL 锚定帧无效，等待有效识别: " + f.fen);
+                    FloatWindowManager.getInstance(this).updateMove(getString(R.string.waiting_recognition));
                     return;
                 }
+                // 桌面端 Initial：首次/重置后重新锚定。初始棋盘红先手，否则按屏幕底部方近似
+                String turn = isStartpos(f) || f.bottomIsRed ? "w" : "b";
+                LogUtil.i(TAG, "INITIAL 重新锚定，按" + ("w".equals(turn) ? "红" : "黑") + "方行棋分析");
+                analyzePosition(f, turn);
+                lastBoard = f.board;
+                lastBoardPart = f.boardPart;
+                state = ChessboardState.GENERIC;
+                break;
             }
-            lastCroppedHash = croppedHash;
-            hasLastCroppedHash = true;
+            case INVALID:
+                // 桌面端 Invalid：复位到初始状态，下一拍由 Initial 重新锚定
+                state = ChessboardState.INITIAL;
+                break;
+            case GENERIC: {
+                // 棋盘未变化，跳过分析（桌面端 board == last_board）
+                if (f.boardPart.equals(lastBoardPart)) break;
 
-            long parseStart = System.currentTimeMillis();
-            String fen = parseCropped(cropped);
-            long parseTime = System.currentTimeMillis() - parseStart;
+                // 符合预期棋盘：对手走了预测着法，行棋方已知，直接分析下一行动方
+                if (expectBoardFen != null && expectBoardFen.equals(f.boardPart)) {
+                    LogUtil.i(TAG, "对手按预期着法走子，直接进入下一回合分析");
+                    lastBoard = f.board;
+                    lastBoardPart = f.boardPart;
+                    analyzePosition(f, expectNextTurn);
+                    break;
+                }
 
-            if (fen == null || fen.isEmpty()) {
-                LogUtil.w(TAG, String.format("未能识别有效局面 (识别耗时: %dms)", parseTime));
+                // 延迟确认：隔 200ms 复抓一帧，局面一致才继续（桌面端 confirm_board）
+                if (!confirmBoard(f)) {
+                    LogUtil.d(TAG, "棋盘延迟确认失败");
+                    break;
+                }
+
+                // 棋盘有效性检查（桌面端 board_check；非法局面会导致引擎原生层崩溃）
+                if (!engineHelper.isValidFen(f.fen)) {
+                    LogUtil.w(TAG, "棋盘识别无效: " + f.fen);
+                    break;
+                }
+
+                // 行棋方推断（对齐桌面端 board_diff 的 One/Move/Unknown 语义，并针对识别
+                // 抖动加固）：
+                // 1) 成对变化（一空一占）= 正常一步棋（含吃子），走子方 = 消失格原子——
+                //    它是上一稳定帧识别过的棋子，比终点格新子可靠；
+                // 2) 多格变化且双方子数不变 = 两步并一帧的偶数步（无吃子），行棋方不变；
+                // 3) 其余（半步、幻影、不成对、带丢子的合并帧）一律视为识别噪声：
+                //    不分析、不锚定坏帧、回滚 pHash 让下一拍重试同画面；连续过多才
+                //    强制按底部方兜底出一次招，保证不无限沉默。
+                //    ——错误提示比短暂沉默危害大：对"缺子/幻影"的局面出招必然是错的。
+                Utils.BoardCompareResult cmp = Utils.compareBoard(lastBoard, f.board);
+                boolean pairMove = cmp.diffCount == 2 && cmp.from.x >= 0 && cmp.to.x >= 0 && cmp.movedChess != null;
+                boolean countsStable = cmp.redDiff == 0 && cmp.blackDiff == 0;
+
+                if (pairMove) {
+                    nextTurn = cmp.movedChess.startsWith("r_") ? "b" : "w";
+                    LogUtil.i(TAG, "走子 " + cmp.movedChess + "，轮到" + ("w".equals(nextTurn) ? "黑" : "红") + "方");
+                    lastBoard = f.board;
+                    lastBoardPart = f.boardPart;
+                    analyzePosition(f, nextTurn);
+                } else if (cmp.diffCount > 2 && countsStable) {
+                    LogUtil.i(TAG, "多格变化且无吃子(" + cmp.diffCount + "格)，按偶数步合并帧处理，行棋方不变");
+                    lastBoard = f.board;
+                    lastBoardPart = f.boardPart;
+                    analyzePosition(f, nextTurn);
+                } else {
+                    // 识别噪声：跳过本轮。回滚 pHash 让下一拍重新识别同一画面；
+                    // 连续过多噪声时强制兜底出招一次，避免无限沉默
+                    untrustedCount++;
+                    LogUtil.i(TAG, "疑似识别噪声(" + cmp.diffCount + "格, 子数差 " + cmp.redDiff + "/" + cmp.blackDiff
+                            + ")，跳过第 " + untrustedCount + " 拍等待干净识别");
+                    rollbackPHash();
+                    if (untrustedCount >= 8) {
+                        LogUtil.w(TAG, "连续噪声帧达到阈值，强制按底部方重锚定当前画面");
+                        untrustedCount = 0;
+                        lastBoard = f.board;
+                        lastBoardPart = f.boardPart;
+                        analyzePosition(f, f.bottomIsRed ? "w" : "b");
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    /**
+     * 阻塞式分析指定行棋方并更新预期（桌面端 analyze_board + analyse）。
+     * 搜索返回后先验证局面是否仍与 analyzed 一致——对手在搜索期间已行棋时
+     * 该结果已过期，不显示，等下一拍循环去分析新局面。
+     */
+    private void analyzePosition(Frame f, String turn) {
+        nextTurn = turn;
+        untrustedCount = 0; // 成功进入分析 = 帧已可信，重置噪声计数
+        String finalFen = f.boardPart + " " + turn + " - - 0 1";
+        // 非法局面会导致 Pikafish 原生层崩溃，提前拦截（双保险，searchSync 内部也会校验）
+        if (!engineHelper.isValidFen(finalFen)) {
+            FloatWindowManager.getInstance(this).updateMove(getString(R.string.waiting_recognition));
+            return;
+        }
+
+        LogUtil.i(TAG, ("w".equals(turn) ? getString(R.string.turn_red) : getString(R.string.turn_black)) + ", start analyze...");
+        FloatWindowManager.getInstance(this).updateMove(getString(R.string.analyzing));
+
+        long startedAt = System.currentTimeMillis();
+        EngineHelper.SearchResult r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+        long engineTime = System.currentTimeMillis() - startedAt;
+
+        if (r != null && "(none)".equals(r.bestMove)) {
+            // 行棋方无合法着法（被将死/困毙）：如实提示，避免悬浮窗停在"正在分析"
+            LogUtil.i(TAG, "该局面已无棋可走（将死/困毙）");
+            FloatWindowManager.getInstance(this).updateMove("已无棋可走（将死/困毙）");
+            return;
+        }
+        if (r == null || r.bestMove == null || r.bestMove.length() < 4) {
+            // 引擎无有效结果：保留悬浮窗当前内容（多为"正在分析"），等下一拍重试
+            LogUtil.w(TAG, "引擎无有效结果 (耗时 " + engineTime + "ms)");
+            return;
+        }
+
+        // 出招先验货：搜索期间对手可能已行棋。过期提示不显示——否则旧招法会在
+        // 对方思考的时间段里一直挂在悬浮窗上。
+        // 验货帧若是 degraded（王不可见、局面不可判），无法断定对手是否行棋，按未行棋处理
+        Frame now = captureFrame(true);
+        if (now != null && !now.degraded && !now.boardPart.equals(f.boardPart)) {
+            LogUtil.i(TAG, "引擎出招时对手已行棋，丢弃过期提示，下一拍分析新局面");
+            return;
+        }
+
+        // 预期棋盘：bestMove 走完后的局面 + 轮到对方；对手照着走时下一拍直接命中
+        String expectFen = Utils.applyMoveToFen(finalFen, r.bestMove);
+        if (expectFen != null && expectFen.contains(" ")) {
+            expectBoardFen = expectFen.split(" ")[0];
+            expectNextTurn = expectFen.split(" ")[1];
+        } else {
+            expectBoardFen = null;
+            expectNextTurn = null;
+        }
+
+        // 记谱需要"屏幕底部方"视角（不是行棋方），否则黑方行棋时中文记谱错位
+        String chinaMove = Utils.fenToChina(this, finalFen, r.bestMove, f.bottomIsRed);
+        String chinaMove2 = (r.ponderMove != null && r.ponderMove.length() >= 4 && !"(none)".equals(r.ponderMove))
+                ? Utils.fenToChina(this, finalFen, r.ponderMove, f.bottomIsRed) : getString(R.string.none_ponder);
+
+        String turnStr = finalFen.contains(" w ") ? getString(R.string.turn_red) : getString(R.string.turn_black);
+        String displayStr = turnStr + "\n" +
+                getString(R.string.recommend) + chinaMove + " (" + r.bestMove + ") + " + getString(R.string.time_consumed) + engineTime / 100 / 10f + "s\n" +
+                getString(R.string.ponder) + chinaMove2 + " (" + (r.ponderMove != null ? r.ponderMove : "none") + ")";
+        LogUtil.d(TAG, getString(R.string.log_best_move, engineTime, displayStr));
+
+        FloatWindowManager.getInstance(this).updateMove(displayStr);
+
+        Intent intentBroadcast = new Intent("com.example.CHESS_RESULT");
+        intentBroadcast.putExtra("displayStr", displayStr);
+        sendBroadcast(intentBroadcast);
+    }
+
+    /**
+     * 延迟确认（桌面端 confirm_board）：隔一小段再抓一帧识别，局面一致才算稳定。
+     * 消灭走子动画帧/触摸高亮帧造成的误识别。
+     */
+    private boolean confirmBoard(Frame f) {
+        SystemClock.sleep(CONFIRM_INTERVAL_MS);
+        Frame conf = captureFrame(true);
+        return conf != null && conf.boardPart.equals(f.boardPart);
+    }
+
+    private boolean isStartpos(Frame f) {
+        return STARTPOS_BOARD.equals(f.boardPart);
+    }
+
+    /**
+     * 截屏 → 智能裁剪 → （可选 pHash 去重）→ 棋子识别。
+     *
+     * @param force true 时跳过 pHash 去重强制识别（确认帧/出招验货帧）
+     * @return 识别成功返回 Frame；无画面/无棋盘/识别失败/画面未变化返回 null
+     */
+    private Frame captureFrame(boolean force) {
+        Bitmap bitmap = captureScreen();
+        if (bitmap == null) return null;
+        try {
+            Bitmap cropped = ChessBoardParser.smartCrop(this, bitmap);
+            if (cropped == null) {
                 onNoBoard();
-                return;
+                return null;
             }
 
-            // pHash 变了但局面没变（悬浮窗文字/光照/动画边缘干扰）
-            if (fen.equals(lastFen)) return;
+            long[] prevHash = lastCroppedHash;
+            boolean prevHas = hasLastCroppedHash;
+            if (!force) {
+                long[] croppedHash = computePHash(cropped);
+                if (prevHas && hammingDistance(croppedHash, prevHash) <= PHASH_THRESHOLD) {
+                    lastCroppedHash = croppedHash;
+                    return null; // 画面未变化，等下一拍
+                }
+                lastCroppedHash = croppedHash;
+                hasLastCroppedHash = true;
+                pendingPrevHash = prevHash;
+                pendingPrevHas = prevHas;
+            }
 
-            // 识别成功，清零连续失败计数
+            String fen = parseCropped(cropped);
+            if (fen == null || fen.isEmpty()) {
+                onNoBoard();
+                return null;
+            }
             noBoardCount = 0;
 
-            LogUtil.d(TAG, getString(R.string.log_fen_recognized, fen, captureTime, detectTime, parseTime));
+            Frame f = new Frame();
+            f.fen = fen;
+            String[] parts = fen.split(" ");
+            f.boardPart = parts[0];
+            f.bottomIsRed = parts.length > 1 && "w".equals(parts[1]);
+            f.board = Utils.fenToBoard(fen);
+            repairKings(f);
 
-            // 参考原型 expect_board：识别局面 == 引擎 bestMove 推演局面 → 对手按预期走子，
-            // 行棋方已知（expectNextTurn），跳过确认直接分析
-            String boardPart = fen.split(" ")[0];
-            if (expectBoardFen != null && expectBoardFen.equals(boardPart)) {
-                lastFen = fen;
-                handleNewPosition(fen, true);
-                return;
+            // 不可信帧守卫：子数凭空增加 = 幻影子；王不可见且补不回 = 局面不可判。
+            // 这类帧不进入状态机（杜绝幻影局面出招），并回滚 pHash 提交让下一拍重试识别。
+            // 若连续多帧都不可信，说明锚定局面已与现实脱节（如复盘箭头/标号被当成棋子、
+            // 或期间有帧被跳过）：强制全量重锚定到当前真实画面，否则旧提示永远挂死无出口
+            if (!force && lastBoard != null) {
+                Utils.BoardCompareResult guard = Utils.compareBoard(lastBoard, f.board);
+                boolean untrusted = guard.redDiff < 0 || guard.blackDiff < 0 || f.degraded;
+                if (untrusted) {
+                    untrustedCount++;
+                    LogUtil.i(TAG, "识别帧不可信(连续第 " + untrustedCount + " 帧，子数差 "
+                            + guard.redDiff + "/" + guard.blackDiff
+                            + (f.degraded ? ",王不可见" : "") + ")");
+                    if (untrustedCount >= 5) {
+                        // 复位到 INITIAL 重新锚定。注意必须保留 lastBoard：它是
+                        // repairKings 相似度护栏的参照——清空后无法区分"同一棋盘的
+                        // 识别噪声"与"换了一个全新棋盘"，王位记忆会把旧局的王补进新局面
+                        LogUtil.w(TAG, "连续不可信帧达到阈值，复位到 INITIAL 重新锚定");
+                        expectBoardFen = null;
+                        expectNextTurn = null;
+                        state = ChessboardState.INITIAL;
+                        untrustedCount = 0;
+                    }
+                    rollbackPHash();
+                    return null;
+                }
+                // 注意：这里不能清零 untrustedCount——子数减少类的噪声帧会通过本守卫、
+                // 在 step() 的噪声跳过分支里计数；清零会让"连续跳过达阈值→强制兜底"
+                // 的恢复出口永远无法触发（计数器互踩，悬浮窗挂死在旧提示上）
             }
-
-            // —— 稳定确认（参考原型 confirm_board）：隔 200ms 复抓一帧，局面一致才分析，
-            //    消灭走子动画帧/触摸高亮帧造成的误识别 ——
-            isAnalyzing = true;
-            lastAnalyzeStartTime = System.currentTimeMillis();
-            SystemClock.sleep(CONFIRM_INTERVAL_MS);
-            String confirmFen = captureAndParseOnce();
-            if (confirmFen == null || !confirmFen.equals(fen)) {
-                LogUtil.d(TAG, "局面未稳定，跳过本轮，等待下一帧");
-                isAnalyzing = false;
-                return;
-            }
-
-            lastFen = fen;
-            handleNewPosition(fen, false);
-        } catch (Exception e) {
-            LogUtil.e(TAG, "Capture error", e);
-            isAnalyzing = false;
+            return f;
         } finally {
-            bitmap.recycle();
+            // 缓存帧是服务持有的，不能回收
+            if (lastScreenRecyclable) bitmap.recycle();
         }
+    }
+
+    /**
+     * 识别丢王修复（带一致性约束）：将军高亮会让 YOLO 丢识别将/帅，缺王局面无法分析。
+     * 但只有"王以外的部分恰好是一步干净棋"才说明走的是别的子、王只是被挡住——
+     * 此时把王补回原位是安全的。若王以外的部分无变化（说明对方走的就是王、逃将后的
+     * 新位置同样识别不到），补回旧位置就是在对幻影局面出招——本轮标记 degraded，
+     * 跳过分析、不锚定，等高亮退去识别恢复。
+     */
+    private Frame repairKings(Frame f) {
+        f.degraded = false;
+        rememberKings(f.board);
+        boolean rPresent = hasKing(f.board, "r_jiang");
+        boolean bPresent = hasKing(f.board, "b_jiang");
+        if (rPresent && bPresent) return f;              // 双王都在，正常
+        if (!rPresent && !bPresent) {                    // 双王全丢：画面大面积不可信
+            f.degraded = true;
+            return f;
+        }
+        String missing = rPresent ? "b_jiang" : "r_jiang";
+
+        // 有锚定基线：先校验"王以外的部分恰好是一步干净棋"（说明对方走的是别的子、
+        // 王只是被高亮挡住），才从基线补回。若王以外的部分无变化，说明对方走的就是王
+        // （逃将后的新位置同样识别不到）——补回旧位置等于对幻影局面出招，宁缺毋滥
+        if (lastBoard != null) {
+            int same = 0;
+            for (int y = 0; y < 10; y++)
+                for (int x = 0; x < 9; x++)
+                    if (lastBoard[x][y] == null ? f.board[x][y] == null : lastBoard[x][y].equals(f.board[x][y]))
+                        same++;
+            if (same < 70) {
+                LogUtil.i(TAG, "与上一局面差异过大(" + same + "/90)，跳过丢王修复");
+                return f;
+            }
+            String[][] lbNoKing = cloneBoard(lastBoard);
+            removeKing(lbNoKing, missing);
+            String[][] fNoKing = cloneBoard(f.board);
+            removeKing(fNoKing, missing);
+            DiffResult d = boardDiff(lbNoKing, fNoKing);
+            if (d.kind != DiffResult.MOVE) {
+                LogUtil.i(TAG, "将/帅被高亮遮挡且疑似已移动，跳过本轮分析等待识别恢复");
+                f.degraded = true;
+                return f;
+            }
+            if (restoreKing(f.board, lastBoard, missing)) {
+                f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
+                f.boardPart = f.fen.split(" ")[0];
+                LogUtil.i(TAG, "识别丢失将/帅（对方走的是其他子），已从上一局面补回: " + f.boardPart);
+                return f;
+            }
+            f.degraded = true;
+            return f;
+        }
+
+        // 无锚定基线（INITIAL/重置后）：按跨重锚定、跨会话的王位记忆补回——
+        // 将/帅离不开九宫，记忆位为空就按记忆补回，远好于永远"等待识别"
+        int[] mem = "r_jiang".equals(missing) ? lastKnownRedKing : lastKnownBlackKing;
+        if (mem != null && f.board[mem[0]][mem[1]] == null) {
+            f.board[mem[0]][mem[1]] = missing;
+            f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
+            f.boardPart = f.fen.split(" ")[0];
+            LogUtil.i(TAG, "识别丢失将/帅，按记忆位置(" + mem[0] + "," + mem[1] + ")补回: " + f.boardPart);
+            return f;
+        }
+
+        // 无王位记忆或记忆位被占：跳过本轮，等某一帧识别出王后重建记忆
+        LogUtil.i(TAG, "将/帅不可见且无王位记忆，跳过本轮分析等待识别恢复");
+        f.degraded = true;
+        return f;
+    }
+
+    /** 从当前帧记忆两王位置（只在王可见时更新；持久化到 SharedPreferences 跨会话使用） */
+    private void rememberKings(String[][] board) {
+        int[] rk = findKing(board, "r_jiang");
+        if (rk != null) {
+            lastKnownRedKing = rk;
+            getSharedPreferences(PREFS_KING_MEM, Context.MODE_PRIVATE).edit()
+                    .putInt("red_x", rk[0]).putInt("red_y", rk[1]).apply();
+        }
+        int[] bk = findKing(board, "b_jiang");
+        if (bk != null) {
+            lastKnownBlackKing = bk;
+            getSharedPreferences(PREFS_KING_MEM, Context.MODE_PRIVATE).edit()
+                    .putInt("black_x", bk[0]).putInt("black_y", bk[1]).apply();
+        }
+    }
+
+    private int[] findKing(String[][] board, String king) {
+        for (int y = 0; y < 10; y++)
+            for (int x = 0; x < 9; x++)
+                if (king.equals(board[x][y])) return new int[]{x, y};
+        return null;
+    }
+
+    private boolean hasKing(String[][] board, String king) {
+        for (int y = 0; y < 10; y++)
+            for (int x = 0; x < 9; x++)
+                if (king.equals(board[x][y])) return true;
+        return false;
+    }
+
+    private String[][] cloneBoard(String[][] src) {
+        String[][] out = new String[9][10];
+        for (int x = 0; x < 9; x++) out[x] = src[x].clone();
+        return out;
+    }
+
+    private void removeKing(String[][] board, String king) {
+        for (int y = 0; y < 10; y++)
+            for (int x = 0; x < 9; x++)
+                if (king.equals(board[x][y])) board[x][y] = null;
+    }
+
+    /** 本帧缺这颗王、且它在上一局面的位置现在为空时，补回并返回 true */
+    private boolean restoreKing(String[][] board, String[][] prev, String king) {
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < 9; x++) {
+                if (king.equals(board[x][y])) return false; // 本帧王还在，无需修复
+            }
+        }
+        int cx = -1, cy = -1;
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < 9; x++) {
+                if (king.equals(prev[x][y])) {
+                    cx = x;
+                    cy = y;
+                }
+            }
+        }
+        if (cx < 0 || board[cx][cy] != null) return false;
+        board[cx][cy] = king;
+        return true;
     }
 
     /**
@@ -361,61 +684,89 @@ public class AnalysisService extends Service {
     }
 
     /**
-     * 处理已确认稳定的新局面：推导行棋方并启动引擎分析。
-     * 参考原型的 board_diff 分类 + expect_board 命中机制。
+     * 从 ImageReader 取整屏帧。
+     * 关键差异：桌面端 xcap 是拉式截屏（每拍都拿到当前画面），而 Android 的
+     * VirtualDisplay+ImageReader 是推式的——画面静止时不产生新帧，acquireLatestImage
+     * 返回空。若直接返回 null，循环会在"最后一帧没分析成功、画面随后静止"时饿死
+     * （新局面永远得不到分析，直到画面再次变化）。因此缓存最近一帧，推帧为空时返回缓存，
+     * 使循环与桌面端语义等价；pHash 去重仍保证静止期不重复跑识别。
      */
-    private void handleNewPosition(String fen, boolean expectHit) {
-        String[][] currentBoard = Utils.fenToBoard(fen);
-        String bottomSide = fen.split(" ")[1]; // 识别 FEN 的第二段 = 屏幕底部方
-        mySide = bottomSide;
+    private Bitmap lastScreen = null;      // 服务持有的最近一帧（captureFrame 不回收它）
+    private boolean lastScreenRecyclable = false;
 
-        if (expectHit) {
-            // 对手走了我方推荐的着法 → 行棋方已知，零猜测
-            nextTurn = expectNextTurn;
-            LogUtil.i(TAG, "对手按预期着法走子，直接进入下一回合分析");
-        } else if (lastBoardArray != null) {
-            Utils.BoardCompareResult cmp = Utils.compareBoard(lastBoardArray, currentBoard);
-            LogUtil.i(TAG, getString(R.string.log_board_change, cmp.diffCount));
-
-            if (cmp.diffCount >= 1 && cmp.diffCount <= 2) {
-                // 走子方 = 变化格新子的颜色；若终点没识别出来（只看到起点消失），
-                // 用消失格原子的颜色兜底——它只是移动到了没识别出的新位置
-                String mover = (cmp.chess != null) ? cmp.chess : cmp.movedChess;
-                nextTurn = (mover != null) ? (mover.startsWith("r_") ? "b" : "w") : bottomSide;
-            } else {
-                // diffCount > 2：两步并一帧/新开局/摆子（原型 Unknown 场景）；diffCount == 0 为防御分支。
-                // 用底部方兜底：双方回合都分析，即使行棋方猜错，下一帧也会修正
-                nextTurn = bottomSide;
-            }
-        } else {
-            // 第一次识别，使用底部方
-            nextTurn = bottomSide;
+    private Bitmap captureScreen() {
+        Image image = imageReader.acquireLatestImage();
+        if (image == null) {
+            lastScreenRecyclable = false;
+            return lastScreen;
         }
-        lastBoardArray = currentBoard;
-        expectBoardFen = null; // 旧预期已消费，分析完成后会生成新预期
-
-        // 构造最终发送给引擎的 FEN
-        String finalFen = fen.split(" ")[0] + " " + nextTurn + " - - 0 1";
-
-        // 双方回合都分析：悬浮窗任何时刻都有推荐（对方回合的推荐可用来预判对手着法）
-        LogUtil.i(TAG, (nextTurn.equals("w") ? getString(R.string.turn_red) : getString(R.string.turn_black)) + ", start analyze...");
-
-        // 先启动分析，成功才把悬浮窗切到"正在分析"；
-        // 否则噪声局面会让悬浮窗永远停在"正在分析"却等不到结果
-        stopTriggeredForCurrentAnalysis = false;
-        boolean started = engineHelper.startAnalyze(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
-        LogUtil.i(TAG, "started="+started);
-        if (!started) {
-            // 非法局面：保留 lastFen/lastBoardArray（该局面就是分析不了，跳过即可；
-            // 不能清空 lastFen，否则同一噪声局面每帧重试 → "正在分析"永挂），
-            // 局面正常变化（识别 FEN 改变）后会自然恢复分析
-            FloatWindowManager.getInstance(this).updateMove(getString(R.string.waiting_recognition));
-            isAnalyzing = false;
-        } else {
-            FloatWindowManager.getInstance(this).updateMove(getString(R.string.analyzing));
+        lastScreenRecyclable = true;
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer = planes[0].getBuffer();
+            int pixelStride = planes[0].getPixelStride();
+            int rowStride = planes[0].getRowStride();
+            int rowPadding = rowStride - pixelStride * screenWidth;
+            Bitmap bitmap = Bitmap.createBitmap(screenWidth + rowPadding / pixelStride, screenHeight, Bitmap.Config.ARGB_8888);
+            bitmap.copyPixelsFromBuffer(buffer);
+            if (lastScreen != null) lastScreen.recycle();
+            lastScreen = bitmap;
+            return bitmap;
+        } finally {
+            image.close();
         }
     }
 
+    /**
+     * 对裁剪图做棋子识别并返回 FEN。ChessBoardParser.parse 内部会回收传入的 bitmap。
+     */
+    private String parseCropped(Bitmap cropped) {
+        final String[] out = {null};
+        ChessBoardParser.parse(this, cropped, (fen, results) -> out[0] = fen);
+        return out[0];
+    }
+
+    /**
+     * 桌面端 board_diff：对比两局面的逐格差异并分类。
+     * - 恰好一格变化 → ONE（半步/漏检帧）；
+     * - 恰好两格且"一空一占"成对 → MOVE，走子方 = 消失格原子（上一稳定帧识别过的棋子，
+     *   比终点格新子可靠——终点格属于刚变化区域，最容易被误检翻转颜色）；
+     * - 其余（多格/两格但不成对）→ UNKNOWN。
+     */
+    private DiffResult boardDiff(String[][] from, String[][] to) {
+        DiffResult r = new DiffResult();
+        if (from == null || to == null) {
+            r.kind = DiffResult.UNKNOWN;
+            return r;
+        }
+        int count = 0;
+        boolean hasFrom = false, hasTo = false;
+        String vanished = null;
+        for (int y = 0; y < 10; y++) {
+            for (int x = 0; x < 9; x++) {
+                boolean same = from[x][y] == null ? to[x][y] == null : from[x][y].equals(to[x][y]);
+                if (!same) {
+                    count++;
+                    if (to[x][y] == null) {
+                        hasFrom = true;
+                        vanished = from[x][y];
+                    } else {
+                        hasTo = true;
+                    }
+                }
+            }
+        }
+        if (count == 1) {
+            r.kind = DiffResult.ONE;
+        } else if (count == 2 && hasFrom && hasTo && vanished != null) {
+            r.kind = DiffResult.MOVE;
+            r.fromPiece = vanished;
+            r.moverCamp = vanished.startsWith("r_") ? "w" : "b";
+        } else {
+            r.kind = DiffResult.UNKNOWN;
+        }
+        return r;
+    }
 
     /**
      * 计算图片的感知哈希 (aHash)：
@@ -484,12 +835,18 @@ public class AnalysisService extends Service {
     @Override
     public void onDestroy() {
         isRunning = false;
-        if (handler != null) handler.removeCallbacksAndMessages(null);
+        if (engineHelper != null) {
+            // 引擎为进程级单例：会话结束只中止在途搜索，不 quit——
+            // 下次会话直接复用（native 回调全局注册，销毁重建会导致回调错位）
+            engineHelper.abortSearch();
+        }
         if (analysisThread != null) analysisThread.quitSafely();
         if (virtualDisplay != null) virtualDisplay.release();
         if (mediaProjection != null) mediaProjection.stop();
-        if (engineHelper != null) engineHelper.stopAnalyze();
-        if (engineHelper != null) engineHelper.stop();
+        if (lastScreen != null) {
+            lastScreen.recycle();
+            lastScreen = null;
+        }
         ChessBoardParser.clearCropCache();
         FloatWindowManager.getInstance(this).hide();
         super.onDestroy();

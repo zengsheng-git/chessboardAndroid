@@ -21,3 +21,4 @@ local.properties
 # 构建产物与工具索引（勿提交）
 *.apk
 .codegraph/
+yieye_debug/

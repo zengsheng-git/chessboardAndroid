@@ -231,14 +231,8 @@ gradlew.bat --version     # 只验证 Gradle + JDK 工具链
 - 剥离符号后 1.55 MB
 
 
-我把之前的分析再核对一遍，确认哪些是真问题、哪些已经失效。先做几个精确验证。
-核对完毕。先修正我之前的一个误判，然后给你确认过的、按优先级排好的问题清单。
 
----
 
-## 先撤回一个误判
 
-我之前预判 **AGP 9 会因 `outputFileName`/`capitalize()` API 变更而编译失败** —— **实际构建通过，未命中**。AGP 9.0.1 仍兼容这套 API。这条可以从问题清单里划掉。
 
----
-
+.\gradlew.bat assembleDebug --console=plain

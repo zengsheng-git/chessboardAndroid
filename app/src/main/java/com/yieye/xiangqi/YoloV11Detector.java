@@ -110,7 +110,11 @@ public class YoloV11Detector implements ChessDetector {
                 }
             }
 
-            if (maxClassScore <= CONF_THRESHOLD) continue;
+            // 将/帅常被将军高亮、装饰环等 UI 元素拉低置信度；对王类放宽门槛。
+            // 下游（ChessBoardParser.resultsToFen）只在九宫格内且格位为空时采纳，误检风险可控
+            float threshold = YoloV5Detector.LABELS[maxClassIdx].endsWith("jiang")
+                    ? YoloV5Detector.KING_CONF_THRESHOLD : CONF_THRESHOLD;
+            if (maxClassScore <= threshold) continue;
 
             // 输出的 cx, cy, w, h 是在 640x640 letterbox 画布坐标系下的
             float cx = output[0][i];

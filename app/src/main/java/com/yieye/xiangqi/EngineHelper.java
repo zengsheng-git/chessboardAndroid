@@ -14,6 +14,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class EngineHelper {
     private static final String TAG = "EngineHelper";
@@ -34,16 +36,23 @@ public class EngineHelper {
     private volatile boolean isUciOk = false;
     private volatile boolean isReadyOk = false;
 
-    public interface BestMoveCallback {
-        void onBestMove(String sourceFen, String bestMove, String ponderMove);
-    }
-
     public interface InfoCallback {
         void onInfo(String cmd, Map<String, String> infos);
     }
 
-    public BestMoveCallback bestMoveEvent;
     public InfoCallback infoEvent;
+
+    /** 一次阻塞式搜索的结果（对齐桌面端 QueryResult 的核心字段） */
+    public static class SearchResult {
+        public String bestMove;
+        public String ponderMove;
+    }
+
+    // 在途搜索：searchSync 与引擎读线程通过它配对 position/go 与 bestmove。
+    // 单线程串行调用 searchSync，任何时刻最多一个在途搜索。
+    // volatile + 无锁 abortSearch：服务销毁时要在 searchSync 持锁阻塞期间也能中止它
+    private volatile SearchResult pendingResult;
+    private volatile CountDownLatch pendingLatch;
 
     public List<String> optionList = new ArrayList<>();
     public Map<String, String> configs = new HashMap<>();
@@ -52,7 +61,7 @@ public class EngineHelper {
     
     public long lastOutputTime = 0;
     public String ignoreMove = "";
-    public boolean initialized = false;
+    public volatile boolean initialized = false;
 
     public native void initJNI(String workDir);
     public native void sendCommandJNI(String cmd);
@@ -222,17 +231,19 @@ public class EngineHelper {
             }
             if (infoEvent != null) infoEvent.onInfo(cmd, infos);
         } else if (cmd.equals("bestmove")) {
-            String sourceFen = this.currentFen;
             String bestMove = args.length > 1 ? args[1] : "";
             String ponderMove = "";
             if (args.length > 3 && args[2].equals("ponder")) {
                 ponderMove = args[3];
             }
-            LogUtil.d(TAG, "Processing bestmove: " + bestMove + " sourceFen: " + sourceFen);
-            if (sourceFen != null && !sourceFen.isEmpty() && bestMoveEvent != null) {
-                bestMoveEvent.onBestMove(sourceFen, bestMove, ponderMove);
-            } else {
-                LogUtil.w(TAG, "Skipping bestMoveEvent: sourceFen is " + (sourceFen == null ? "null" : "empty") + " or callback is null");
+            LogUtil.d(TAG, "Processing bestmove: " + bestMove + " sourceFen: " + this.currentFen);
+            // 唤醒阻塞中的 searchSync；没有在途搜索时（stop 触发的残留回调）直接丢弃
+            SearchResult p = this.pendingResult;
+            if (p != null) {
+                p.bestMove = bestMove;
+                p.ponderMove = ponderMove;
+                CountDownLatch l = this.pendingLatch;
+                if (l != null) l.countDown();
             }
             this.currentFen = "";
         } else if (cmd.equals("option")) {
@@ -267,25 +278,65 @@ public class EngineHelper {
     }
 
     /**
-     * @return 局面合法并已开始分析返回 true；非法局面被跳过返回 false。
+     * 阻塞式搜索（对齐桌面端 block_on(engine.search())）：发出 position+go 后等待
+     * bestmove 才返回。与截屏循环在同一条线程串行调用，任何时刻最多一个在途搜索，
+     * position/go 永远不会发进正在搜索的引擎——并发分析类竞态在结构上不存在。
+     *
+     * @return 引擎结果；非法局面/引擎未就绪/超时无结果返回 null
      */
-    public boolean startAnalyze(String fen, double timeSec, int depth) {
-        // 防止非法局面导致 Pikafish 引擎原生层崩溃 (SIGSEGV in NNUE evaluate)
+    public synchronized SearchResult searchSync(String fen, double timeSec, int depth) {
         if (!isValidFen(fen)) {
-            LogUtil.w("EngineHelper", "非法 FEN，跳过分析: " + fen);
-            return false;
+            LogUtil.w(TAG, "非法 FEN，跳过分析: " + fen);
+            return null;
         }
-//        sendCommand("stop");
+        // 引擎异步初始化（uciok 握手/NNUE 拷贝），首局分析最多等 5 秒就绪
+        long waitStart = System.currentTimeMillis();
+        while (!initialized) {
+            if (System.currentTimeMillis() - waitStart > 5000) {
+                LogUtil.w(TAG, "引擎未就绪，跳过分析");
+                return null;
+            }
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            }
+        }
+        pendingResult = new SearchResult();
+        pendingLatch = new CountDownLatch(1);
         this.currentFen = fen;
         sendCommand("position fen " + fen);
-        // 对齐 Windows EngineHelper.StartAnalyze：depth 与 movetime 双重限制，谁先到谁生效，
-        // 避免简单局面也死等固定深度、复杂局面又跑到超时才被强制打断
+        // 对齐 Windows EngineHelper.StartAnalyze：depth 与 movetime 双重限制，谁先到谁生效
         if (timeSec > 0) {
             sendCommand("go movetime " + (int) (timeSec * 1000) + " depth " + depth);
         } else {
             sendCommand("go depth " + depth);
         }
-        return true;
+        try {
+            // movetime 是引擎硬上限，正常一定在此之前收到 bestmove；超时说明引擎卡死，
+            // 发 stop 兜底后再短暂等待残留的 bestmove
+            if (!pendingLatch.await((long) (timeSec * 1000) + 3000, TimeUnit.MILLISECONDS)) {
+                LogUtil.w(TAG, "引擎搜索超时，强制停止");
+                sendCommand("stop");
+                pendingLatch.await(2000, TimeUnit.MILLISECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        SearchResult r = pendingResult;
+        pendingResult = null;
+        pendingLatch = null;
+        return r;
+    }
+
+    /** 立即放弃在途搜索（服务销毁时用），让阻塞中的 searchSync 马上返回。
+     *  不能加 synchronized：searchSync 持锁阻塞等待中，加锁会互相等死 */
+    public void abortSearch() {
+        CountDownLatch l = pendingLatch;
+        if (l != null) {
+            l.countDown();
+        }
     }
 
     /**
@@ -295,7 +346,7 @@ public class EngineHelper {
      * 识别错误时可能产生多余棋子，Pikafish 原生层会写溢出内部数组导致 evaluate 崩溃，
      * 因此这里严格校验，非法局面直接跳过。
      */
-    private boolean isValidFen(String fen) {
+    public boolean isValidFen(String fen) {
         if (fen == null || fen.isEmpty()) return false;
         String boardPart = fen.split(" ")[0];
         String[] rows = boardPart.split("/");

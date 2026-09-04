@@ -110,7 +110,7 @@ build-tools\36.0.0\apksigner.bat verify --print-certs app\build\outputs\apk\debu
 
 ### Release 版 —— 必须自备密钥
 
-```61:68:app/build.gradle
+```groovy
         release {
             minifyEnabled true
             shrinkResources true
@@ -159,7 +159,7 @@ adb install -r app\build\outputs\apk\debug\yi_debug_xxx.apk
 ### 首次运行权限流程
 
 1. 打开 App → 顶部黄色横幅提示 → 点「开启」去开**悬浮窗权限**
-2. 返回 → 选择计算深度（默认 14）→ 点「启动分析服务」
+2. 返回 → 选择计算深度（默认 20）→ 点「启动分析服务」
 3. 系统弹出**屏幕录制授权** → 允许 → App 自动退到后台
 4. 打开象棋 App 对弈，悬浮窗实时显示中文推荐走法
 
@@ -239,7 +239,7 @@ git -c http.proxy=http://127.0.0.1:7890 push
 | AGP 自动补装 NDK 28.2.13676358 | 自动完成 |
 | **完整首次构建** | **7 分 53 秒** |
 | **产出 APK** | **yi_debug_0.0.2.apk / 106.7 MB** |
-| **当前版本（0.0.18，含识别架构重构）** | yi_debug_0.0.18.apk |
+| **当前版本（0.0.35，桌面端模型 + 依赖瘦身，APK 约 97 MB）** | yi_debug_0.0.35.apk |
 
 产物校验（`lib/arm64-v8a/libpikafish.so`）：
 - ELF magic `\x7fELF` ✅ · ELF64 ✅ · `ET_DYN` ✅ · **EM_AArch64 (183)** ✅
@@ -266,16 +266,21 @@ git -c http.proxy=http://127.0.0.1:7890 push
 
 ### 8.2 识别方案（关键决策）
 
-- **模型回退到 `middle.onnx`**——它与桌面端 chessboard 的 `large.onnx` 是**同一文件**
-  （MD5 一致），是桌面端实战验证过的稳定模型。此前切到 `yolov11.onnx` 后，
-  在腾讯象棋的将军高亮/装饰环下频繁丢子、棋子变异、幻影，
-  是本轮大部分"轮次错报/错误提示"的识别层根源。
-- 置信度门槛 **0.7**（与桌面端同值）；新增**每类棋子数量上限**过滤
+- **模型由 `ChessBoardParser.USE_YOLO_V11` 开关二选一**（两个文件均与桌面端同源）：
+  - `false` = `middle.onnx` + YoloV5Detector——与桌面端 chessboard 现用的
+    `large.onnx` 是**同一文件**（MD5 `d346664b` 一致）；**0.0.35 起用此路径**做 A/B；
+  - `true` = `yolov11.onnx`（与桌面端某次旧构建的模型同源，MD5 `3b3c6e02`），
+    0.0.19~0.0.34 主用；曾在腾讯象棋的将军高亮/装饰环下频繁丢子、棋子变异、幻影，
+    是当时一系列"轮次错报/错误提示"的识别层根源。
+- 置信度门槛 **0.35**（不是桌面端的 0.7——同款模型下手机采集域棋子更小、
+  走子高亮压分，0.7 在手机上系统性漏检）；新增**每类棋子数量上限**过滤
   （车马炮×2、士象×2、兵×5、将帅×1），高亮/装饰误检的幻影棋子在此被结构性丢弃。
-- **将/帅在九宫格内放宽置信度至 0.2**：将军高亮与装饰环会拉低王类置信度；
-  仅接受九宫格内、格位为空、同侧无王的位置。
+- **将/帅放宽至 0.2**：将军高亮与装饰环会拉低王类置信度，两条模型路径的检测器
+  均对王类单独放宽门槛（`KING_CONF_THRESHOLD`）；解析层仅在九宫格内、格位为空、
+  同侧无王时采纳（`resultsToFen` 的 `lowConfKings` 补位）。
 - 手机采集域与 PC 不同（棋子更小、高亮更多），若出现大面积漏检，
-  优先调整 `YoloV5Detector.CONF_THRESHOLD`，不要动模型。
+  优先调整 `YoloV5Detector.CONF_THRESHOLD`，不要动模型；
+  若幻影/变异变多，切回 `USE_YOLO_V11 = true` 对比。
 
 ### 8.3 行棋方推断规则
 
@@ -308,4 +313,5 @@ git -c http.proxy=http://127.0.0.1:7890 push
   （属模型训练数据缺失，根治需用带装饰的棋盘截图微调模型）；
 - **复盘页轮次标签**：浏览历史局面时"轮到谁"在画面上不存在，App 按底部方猜测，
   进入复盘后翻一步即自动纠正；
-- 无云库辅助，每步搜索最长 5s（`AnalysisService.ENGINE_STEP_TIME_SEC`）。
+- 云库未命中/熔断期间回退本地引擎，每步搜索最长 5s（`AnalysisService.ENGINE_STEP_TIME_SEC`）；
+  云库命中但无次优候选时需等本地引擎补充一次 MultiPV（耗时约等于引擎思考时间）。

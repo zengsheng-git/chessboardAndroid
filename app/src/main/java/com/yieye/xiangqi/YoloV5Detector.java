@@ -32,6 +32,10 @@ public class YoloV5Detector implements ChessDetector {
     // 棋子更小、走子高亮会压低置信度，桌面端实测稳定的 0.7 在手机上会系统性漏检，
     // 故下调到 0.35。噪声由 CLASS_LIMITS 与 AnalysisService 的帧级守卫兜底
     public static final float CONF_THRESHOLD = 0.35f;
+    // 将/帅常被将军高亮、装饰环等 UI 元素拉低置信度；对王类放宽门槛（对齐 V11 路径）。
+    // 低于 CONF_THRESHOLD 的王检测由 ChessBoardParser.resultsToFen 的 lowConfKings
+    // 仅在九宫格内且格位为空时采纳，误检风险可控
+    public static final float KING_CONF_THRESHOLD = 0.2f;
     private static final float NMS_THRESHOLD = 0.45f;
     // 对齐桌面端 yolo.rs 的 LIMIT：每类棋子数量上限，超出只保留得分最高的——
     // 将军高亮/装饰环被误检成棋子时在此被结构性过滤，不再污染后续局面分析
@@ -85,7 +89,8 @@ public class YoloV5Detector implements ChessDetector {
         List<YoloResult> detections = new ArrayList<>();
 
         for (float[] row : output) {
-            // 对齐桌面端 yolo.rs：唯一门槛 = objConf × 类别概率（桌面端 0.7）
+            // 对齐桌面端 yolo.rs：门槛 = objConf × 类别概率（桌面端 0.7）；
+            // 王类单独放宽到 0.2（与 YoloV11Detector 相同的按类阈值）
             int maxClassIdx = -1;
             float maxClassProb = -1f;
             for (int i = 5; i < 20; i++) {
@@ -96,7 +101,8 @@ public class YoloV5Detector implements ChessDetector {
             }
 
             float finalScore = row[4] * maxClassProb;
-            if (finalScore > CONF_THRESHOLD) {
+            float threshold = LABELS[maxClassIdx].endsWith("jiang") ? KING_CONF_THRESHOLD : CONF_THRESHOLD;
+            if (finalScore > threshold) {
                 float cx = row[0] * origW / (float) INPUT_WIDTH;
                 float cy = row[1] * origH / (float) INPUT_HEIGHT;
                 float w = row[2] * origW / (float) INPUT_WIDTH;
@@ -123,10 +129,6 @@ public class YoloV5Detector implements ChessDetector {
         }
         return out;
     }
-
-    // 将/帅常被将军高亮、装饰环等 UI 元素拉低置信度；对王类放宽门槛。
-    // 下游（ChessBoardParser.resultsToFen）只在九宫格内且格位为空时采纳，误检风险可控
-    public static final float KING_CONF_THRESHOLD = 0.2f;
 
     private List<YoloResult> applyNMS(List<YoloResult> boxes) {
         if (boxes.isEmpty()) return boxes;

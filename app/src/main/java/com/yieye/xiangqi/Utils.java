@@ -25,8 +25,7 @@ public class Utils {
     public static class BoardCompareResult {
         // C# 版本里 BoardCompareResult 是 struct，From/To 未赋值时默认 Point(0,0)；
         // Android 这里是 class，Point 引用不赋值默认是 null。为避免以后有代码在
-        // diffCount==0 时读取 from/to 触发空指针，这里显式给一个和项目里其它地方
-        // (如 ImageHelper.findImage 找不到时返回 (-1,-1)) 一致的"无效坐标"默认值。
+        // diffCount==0 时读取 from/to 触发空指针，这里显式给一个 (-1,-1) 的"无效坐标"默认值。
         public Point from = new Point(-1, -1);
         public Point to = new Point(-1, -1);
         public String chess;

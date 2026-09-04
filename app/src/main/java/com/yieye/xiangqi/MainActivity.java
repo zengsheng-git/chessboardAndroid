@@ -6,17 +6,12 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.graphics.Bitmap;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.widget.Button;
-import android.widget.ImageView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -26,12 +21,9 @@ import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
 import androidx.core.view.WindowInsetsCompat;
 
-import java.util.List;
-
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "ChessLogic";
     private static final int REQUEST_MEDIA_PROJECTION = 1001;
-    private ImageView debugImageView;
     private TextView resultTextView;
     private android.view.View permissionLayout;
     private Button btnStartService;
@@ -61,7 +53,6 @@ public class MainActivity extends AppCompatActivity {
             return insets;
         });
 
-        debugImageView = findViewById(R.id.debugImageView);
         resultTextView = findViewById(R.id.resultTextView);
         permissionLayout = findViewById(R.id.permissionLayout);
         Button btnOpenPermission = findViewById(R.id.btnOpenPermission);
@@ -218,27 +209,5 @@ public class MainActivity extends AppCompatActivity {
                 updatePermissionBanner();
             }
         }
-    }
-
-    private void drawDetections(Bitmap bitmap, List<YoloResult> results) {
-        Bitmap mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true);
-        Canvas canvas = new Canvas(mutableBitmap);
-        Paint paint = new Paint();
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(4);
-        paint.setTextSize(40);
-
-        for (YoloResult res : results) {
-            if (res.labelName.equals("board")) {
-                paint.setColor(Color.GREEN);
-            } else {
-                paint.setColor(Color.RED);
-            }
-            canvas.drawRect(res.rect, paint);
-            paint.setStyle(Paint.Style.FILL);
-            canvas.drawText(res.labelName, res.rect.left, res.rect.top, paint);
-            paint.setStyle(Paint.Style.STROKE);
-        }
-        debugImageView.setImageBitmap(mutableBitmap);
     }
 }

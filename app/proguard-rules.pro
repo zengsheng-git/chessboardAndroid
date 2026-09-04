@@ -40,17 +40,3 @@
 # Keep PowerKeeper related hooks if any
 -keep class com.miui.powerkeeper.** { *; }
 -dontwarn com.miui.powerkeeper.**
-
-# WorkManager / Room
--keep class androidx.work.impl.WorkDatabase_Impl { *; }
--keep class androidx.work.impl.background.systemalarm.SystemAlarmService { *; }
--keep class androidx.work.impl.background.systemjob.SystemJobService { *; }
--keep class androidx.work.impl.foreground.SystemForegroundService { *; }
--keep class androidx.work.impl.diagnostics.DiagnosticsReceiver { *; }
--keep class androidx.work.impl.utils.ForceStopRunnable$BroadcastReceiver { *; }
--keep class androidx.work.impl.background.systemalarm.ConstraintProxy$BatteryChargingProxy { *; }
--keep class androidx.work.impl.background.systemalarm.ConstraintProxy$BatteryNotLowProxy { *; }
--keep class androidx.work.impl.background.systemalarm.ConstraintProxy$StorageNotLowProxy { *; }
--keep class androidx.work.impl.background.systemalarm.ConstraintProxy$NetworkStateProxy { *; }
--keep class androidx.work.impl.background.systemalarm.RescheduleReceiver { *; }
--keep class androidx.work.impl.background.systemalarm.ConstraintProxyUpdateReceiver { *; }

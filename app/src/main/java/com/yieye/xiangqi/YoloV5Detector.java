@@ -54,18 +54,23 @@ public class YoloV5Detector implements ChessDetector {
 
     @Override
     public List<YoloResult> detect(Bitmap bitmap) throws Exception {
-        // 使用保持比例的缩放 (Letterbox 思想的简化版)
+        // 与桌面端 yolo.rs 一致的拉伸缩放到 640x640（resize_exact，不保持比例）
         Bitmap resizedBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_WIDTH, INPUT_HEIGHT, true);
 
         float[] imgData = new float[1 * 3 * INPUT_WIDTH * INPUT_HEIGHT];
-        for (int y = 0; y < INPUT_HEIGHT; y++) {
-            for (int x = 0; x < INPUT_WIDTH; x++) {
-                int pixel = resizedBitmap.getPixel(x, y);
-                // 绝大多数导出到 ONNX 的 YOLOv5 模型使用 0-1 归一化
-                imgData[y * INPUT_WIDTH + x] = Color.red(pixel) / 255.0f;
-                imgData[INPUT_WIDTH * INPUT_HEIGHT + y * INPUT_WIDTH + x] = Color.green(pixel) / 255.0f;
-                imgData[2 * INPUT_WIDTH * INPUT_HEIGHT + y * INPUT_WIDTH + x] = Color.blue(pixel) / 255.0f;
-            }
+        // 整图一次 getPixels 取回再逐格读：getPixel 每次都有 JNI 开销，
+        // 640x640 ≈ 40 万次调用会占掉单帧数百毫秒（对齐 YoloV11Detector 的做法）
+        int[] pixels = new int[INPUT_WIDTH * INPUT_HEIGHT];
+        resizedBitmap.getPixels(pixels, 0, INPUT_WIDTH, 0, 0, INPUT_WIDTH, INPUT_HEIGHT);
+        resizedBitmap.recycle();
+
+        int plane = INPUT_WIDTH * INPUT_HEIGHT;
+        for (int i = 0; i < plane; i++) {
+            int p = pixels[i];
+            // 绝大多数导出到 ONNX 的 YOLOv5 模型使用 0-1 归一化
+            imgData[i] = ((p >> 16) & 0xFF) / 255.0f;          // R
+            imgData[plane + i] = ((p >> 8) & 0xFF) / 255.0f;   // G
+            imgData[2 * plane + i] = (p & 0xFF) / 255.0f;      // B
         }
 
         OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(imgData), new long[]{1, 3, INPUT_WIDTH, INPUT_HEIGHT});

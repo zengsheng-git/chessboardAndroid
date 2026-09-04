@@ -17,11 +17,15 @@ public class ChessBoardParser {
         void onResult(String fen, List<YoloResult> results);
     }
 
-    // false = 使用 middle.onnx + YoloV5Detector——middle.onnx 与桌面端 chessboard 的
-    // large.onnx 为同一文件（MD5 一致），是桌面端实战验证过的稳定识别模型。
-    // 切到 yolov11.onnx 后在腾讯象棋的将军高亮/装饰环下频繁丢子、变异、幻影，
-    // 是此前一系列"轮次错报/错误提示"的识别层根源，故回退桌面端方案
-    private static final boolean USE_YOLO_V11 = true;
+    // 两个模型的选用历史（手机上均长期试用过）：
+    //   true  = yolov11.onnx（与桌面端某次旧构建的 large.onnx 同源，MD5 3b3c6e02）；
+    //           曾在腾讯象棋将军高亮/装饰环下丢子、变异、幻影，靠 0.35 阈值 +
+    //           王类放宽 0.2 + 每类 LIMIT + 帧级守卫兜住
+    //   false = middle.onnx + YoloV5Detector——与桌面端 chessboard 现用的
+    //           large.onnx 为同一文件（MD5 d346664b 一致）；桌面端 0.7 阈值在
+    //           手机小屏上系统性漏检，V5 检测器已降至 0.35
+    // 当前切回桌面端模型做 A/B 对比：若幻影/漏检变多可随时切回 true
+    private static final boolean USE_YOLO_V11 = false;
 
     private static ChessDetector cachedDetector;
     private static RectF cachedCropRect = null;
@@ -136,10 +140,8 @@ public class ChessBoardParser {
         } catch (Exception e) {
 //            LogUtil.e(TAG, "Smart crop error", e);
         }
-        
-        // 如果未检测到棋盘或出错，回退到原来的裁剪逻辑
-//        LogUtil.w(TAG, "未检测到棋盘标签，使用回退裁剪方案");
-//        return ChessRecognizer.corpBitmap(context, bitmap);
+
+        // 未检测到棋盘或出错：返回 null 让上层按"无棋盘"处理（连续多次会清裁剪缓存重新定位）
         return null;
     }
     

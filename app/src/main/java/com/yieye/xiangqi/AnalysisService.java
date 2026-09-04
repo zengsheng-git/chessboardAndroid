@@ -126,6 +126,8 @@ public class AnalysisService extends Service {
         String[][] board;    // 归一化棋盘数组（供逐格 diff）
         boolean bottomIsRed;
         boolean degraded;    // 将/帅不可见且无法安全补回：本轮不分析不锚定
+        boolean repaired;    // 王（或其他子）是修复补回的：识别在遮挡期不可信，
+                             // 与基线的差异可能是抖动，不得据此翻轮次/分析
     }
 
     /** 桌面端 board_diff 分类结果（丢王修复的"王外着法"分类用） */
@@ -346,6 +348,25 @@ public class AnalysisService extends Service {
                     break;
                 }
 
+                // 修复帧守卫：本帧的王是补回的——高亮遮挡期内识别同样会抖动其他子，
+                // 此时与基线的"一步棋"差异不可信（案例：马在 d8/f9 间抖动被当成红方
+                // 又走了一步，翻错轮次并对旧局面重复出招）。不据此翻轮次、不分析、
+                // 不锚定，等遮挡退去后的干净帧；连续过多时走强制兜底出口
+                if (f.repaired) {
+                    untrustedCount++;
+                    LogUtil.i(TAG, "修复帧与基线存在差异(" + Utils.compareBoard(lastBoard, f.board).diffCount
+                            + "格)，疑似遮挡期识别抖动，跳过第 " + untrustedCount + " 拍等待干净识别");
+                    rollbackPHash();
+                    if (untrustedCount >= 8) {
+                        LogUtil.w(TAG, "连续噪声帧达到阈值，强制按底部方重锚定当前画面");
+                        untrustedCount = 0;
+                        lastBoard = f.board;
+                        lastBoardPart = f.boardPart;
+                        analyzePosition(f, f.bottomIsRed ? "w" : "b");
+                    }
+                    break;
+                }
+
                 // 行棋方推断（对齐桌面端 board_diff 的 One/Move/Unknown 语义，并针对识别
                 // 抖动加固）：
                 // 1) 成对变化（一空一占）= 正常一步棋（含吃子），走子方 = 消失格原子——
@@ -361,7 +382,7 @@ public class AnalysisService extends Service {
 
                 if (pairMove) {
                     nextTurn = cmp.movedChess.startsWith("r_") ? "b" : "w";
-                    LogUtil.i(TAG, "走子 " + cmp.movedChess + "，轮到" + ("w".equals(nextTurn) ? "黑" : "红") + "方");
+                    LogUtil.i(TAG, "走子 " + cmp.movedChess + "，轮到" + ("w".equals(nextTurn) ? "红" : "黑") + "方");
                     lastBoard = f.board;
                     lastBoardPart = f.boardPart;
                     analyzePosition(f, nextTurn);
@@ -542,14 +563,19 @@ public class AnalysisService extends Service {
         sendBroadcast(intentBroadcast);
     }
 
-    /** 云库查询（带熔断）：连续 2 次不可达则 5 分钟内直接走本地引擎，避免离线时每步白等 */
+    /**
+     * 云库查询（带熔断）：只对网络不可达（SERVER_ERROR）计数，连续 2 次则 5 分钟内直接走
+     * 本地引擎，避免离线时每步白等。"库中无此局面"（UNKNOWN）是云库的正常应答——
+     * 恰恰证明网络通着，必须重置计数；此前与网络失败混为一谈，两个未收录局面
+     * 就会误熔断 5 分钟，白白失去云库加速。
+     */
     private ChessDB.Result queryCloudSafe(String fen, int timeoutSec, int multipv, int altScoreGap) {
         long now = SystemClock.elapsedRealtime();
         if (now < cloudCooldownUntil) {
-            return new ChessDB.Result();   // unknown → 本地引擎
+            return new ChessDB.Result();   // 熔断期内直接走本地引擎
         }
         ChessDB.Result r = ChessDB.query(fen, timeoutSec, multipv, altScoreGap);
-        if (ChessDB.STATE_UNKNOWN.equals(r.state)) {
+        if (ChessDB.STATE_SERVER_ERROR.equals(r.state)) {
             cloudFailStreak++;
             if (cloudFailStreak >= 2) {
                 cloudFailStreak = 0;
@@ -557,7 +583,7 @@ public class AnalysisService extends Service {
                 LogUtil.w(TAG, "云库连续不可达，5 分钟内直接走本地引擎");
             }
         } else {
-            cloudFailStreak = 0;
+            cloudFailStreak = 0;   // 正常应答（含库中无此局面）= 云库可达
         }
         return r;
     }
@@ -703,6 +729,7 @@ public class AnalysisService extends Service {
      */
     private Frame repairKings(Frame f) {
         f.degraded = false;
+        f.repaired = false;
         rememberKings(f.board);
         boolean rPresent = hasKing(f.board, "r_jiang");
         boolean bPresent = hasKing(f.board, "b_jiang");
@@ -735,6 +762,7 @@ public class AnalysisService extends Service {
             if (d.kind == DiffResult.MOVE && restoreKing(f.board, lastBoard, missing)) {
                 f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
                 f.boardPart = f.fen.split(" ")[0];
+                f.repaired = true;
                 LogUtil.i(TAG, "识别丢失将/帅（对方走的是其他子），已从上一局面补回: " + f.boardPart);
                 return f;
             }
@@ -746,6 +774,7 @@ public class AnalysisService extends Service {
             f.board[memSpot[0]][memSpot[1]] = missing;
             f.fen = Utils.boardToFen(f.board, f.bottomIsRed);
             f.boardPart = f.fen.split(" ")[0];
+            f.repaired = true;
             LogUtil.i(TAG, "识别丢失将/帅，按王位记忆(" + memSpot[0] + "," + memSpot[1] + ")补回: " + f.boardPart);
             return f;
         }

@@ -11,8 +11,9 @@ import java.util.List;
 
 /**
  * chessdb.cn 云库查询（对齐桌面端 engine/chessdb.rs 的 querypv + queryall）。
- * 命中云库可秒出招并带完整后续线与次优候选；未命中/网络失败按 unknown 处理，
- * 回退本地引擎。必须在工作线程调用（内部为阻塞 HTTP）。
+ * 命中云库可秒出招并带完整后续线与次优候选；库中无此局面按 unknown 处理（正常应答），
+ * 网络不可达按 server_error 处理（供调用方计熔断）；两者都回退本地引擎。
+ * 必须在工作线程调用（内部为阻塞 HTTP）。
  */
 public final class ChessDB {
     private static final String URL = "http://www.chessdb.cn/chessdb.php";
@@ -21,8 +22,9 @@ public final class ChessDB {
     private static final String REFERER = "https://www.chessdb.cn/query/";
 
     public static final String STATE_SUCCESS = "success";
-    public static final String STATE_UNKNOWN = "unknown";
+    public static final String STATE_UNKNOWN = "unknown";           // 云库已应答，但库中无此局面（正常）
     public static final String STATE_INVALID = "invalid";
+    public static final String STATE_SERVER_ERROR = "server_error"; // 网络不可达/非 200（对齐桌面端 ServerInternalError）
 
     public static class Result {
         public String state = STATE_UNKNOWN;    // success / unknown / invalid
@@ -36,7 +38,9 @@ public final class ChessDB {
 
     /**
      * 阻塞查询：querypv 拿最优线 + queryall 拿次优候选（multipv>1 时，对齐桌面端）。
-     * 任何网络/解析失败都按 unknown 返回，由调用方回退本地引擎。
+     * 状态语义（对齐桌面端 QueryState）：
+     *   SUCCESS = 命中最优线；UNKNOWN = 云库已应答但库中无此局面（正常，不计熔断）；
+     *   INVALID = 非法局面/终局；SERVER_ERROR = 网络不可达/非 200（计熔断）。
      */
     public static Result query(String fen, int timeoutSec, int multipv, int altScoreGap) {
         Result r = new Result();
@@ -50,7 +54,10 @@ public final class ChessDB {
             conn.setRequestProperty("Referer", REFERER);
 
             int code = conn.getResponseCode();
-            if (code != 200) return r;
+            if (code != 200) {
+                r.state = STATE_SERVER_ERROR;
+                return r;
+            }
 
             StringBuilder sb = new StringBuilder();
             try (BufferedReader br = new BufferedReader(
@@ -99,7 +106,9 @@ public final class ChessDB {
             }
             return r;
         } catch (Exception e) {
-            return r;   // unknown → 本地引擎
+            // 网络/超时等异常：标记不可达（计熔断）；不覆盖已成功的结果
+            if (STATE_UNKNOWN.equals(r.state)) r.state = STATE_SERVER_ERROR;
+            return r;
         } finally {
             if (conn != null) conn.disconnect();
         }
@@ -109,7 +118,7 @@ public final class ChessDB {
      * queryall：该局面所有合法应走的云端评分。
      * 响应按 | 分隔，每项形如 move:xxxx,score:nnn,rank:n；
      * 跳过与 best 相同的着法，只保留分数 ≥ 最优分 − altScoreGap 的，最多 maxAlt 个。
-     * 任何失败都返回空列表（调用方回退本地引擎）。
+     * 任何失败都返回空列表（由调用方用本地引擎补充次优，不影响熔断计数）。
      */
     private static List<EngineHelper.AltCandidate> queryAll(String fen, int timeoutSec, int altScoreGap,
                                                             int cloudScore, String bestMove, int maxAlt) {

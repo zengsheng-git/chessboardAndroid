@@ -28,7 +28,9 @@ import android.view.WindowManager;
 import androidx.core.app.NotificationCompat;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 
 /**
  * 完全对齐桌面端 chessboard 原型（server/src/worker.rs）的单线程同步架构：
@@ -182,6 +184,11 @@ public class AnalysisService extends Service {
 
         // 显示悬浮窗
         FloatWindowManager.getInstance(this).show();
+        // 棋盘镜像悬浮窗（桌面端完整棋盘 UI 的移动端等价物），主界面可开关
+        if (getSharedPreferences(FloatWindowManager.PREFS_UI, Context.MODE_PRIVATE)
+                .getBoolean(FloatWindowManager.KEY_BOARD_MIRROR, true)) {
+            FloatWindowManager.getInstance(this).showBoard();
+        }
     }
 
     @Override
@@ -527,6 +534,13 @@ public class AnalysisService extends Service {
         }
         String altText = altTextSb.toString();
         String evalText = formatEval(r.score);
+
+        // ④ 棋盘镜像悬浮窗：屏幕方向棋盘（数组底部=屏幕底部）+ 最优招（蓝）/次优候选（紫）落点高亮
+        List<String> altIccs = new ArrayList<>();
+        if (r.alternatives != null) {
+            for (EngineHelper.AltCandidate a : r.alternatives) altIccs.add(a.move);
+        }
+        FloatWindowManager.getInstance(this).updateBoard(f.board, f.bottomIsRed, r.bestMove, altIccs);
 
         // 悬浮窗富文本（配色对齐桌面端 Analyse.vue）：
         // 推荐招法=蓝(info) 深度=橙(warning) 备选招法=紫(#9b59b6) 形势=优绿/劣红 均势灰

@@ -7,6 +7,7 @@
     <string name="stop_analysis">停止分析服务</string>
     <string name="board_recognition_debug">棋盘识别调试</string>
     <string name="calculation_depth">计算深度:</string>
+    <string name="board_mirror">棋盘镜像</string>
     <string name="waiting_analysis">等待分析...</string>
     <string name="analysis_service_started">分析服务已启动</string>
     <string name="grant_float_permission_tip">请授予悬浮窗权限以显示推荐走法</string>

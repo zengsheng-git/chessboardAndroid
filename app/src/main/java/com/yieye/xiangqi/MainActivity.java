@@ -12,6 +12,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -61,6 +62,7 @@ public class MainActivity extends AppCompatActivity {
         Button btnBatterySetting = findViewById(R.id.btnBatterySetting);
 
         initDepthSpinner();
+        initBoardMirrorToggle();
 
         btnBatterySetting.setOnClickListener(v -> {
             Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
@@ -169,6 +171,26 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onNothingSelected(android.widget.AdapterView<?> parent) {
+            }
+        });
+    }
+
+    /** 棋盘镜像悬浮窗开关：立即生效并持久化，服务下次启动也按此开关显示 */
+    private void initBoardMirrorToggle() {
+        CheckBox boardToggle = findViewById(R.id.checkboxBoardMirror);
+        android.content.SharedPreferences ui = getSharedPreferences(FloatWindowManager.PREFS_UI, MODE_PRIVATE);
+        boardToggle.setChecked(ui.getBoolean(FloatWindowManager.KEY_BOARD_MIRROR, true));
+        boardToggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (isChecked && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+                boardToggle.setChecked(false);
+                Toast.makeText(this, R.string.grant_float_permission_tip, Toast.LENGTH_LONG).show();
+                return;
+            }
+            ui.edit().putBoolean(FloatWindowManager.KEY_BOARD_MIRROR, isChecked).apply();
+            if (isChecked) {
+                FloatWindowManager.getInstance(this).showBoard();
+            } else {
+                FloatWindowManager.getInstance(this).hideBoard();
             }
         });
     }

@@ -52,7 +52,13 @@ public class AnalysisService extends Service {
     // 桌面端 timer_interval=200ms；Android 单拍含截屏+哈希开销更大，取 300ms 兼顾反应速度与功耗
     private static final long LOOP_INTERVAL_MS = 300;
     private static final long CONFIRM_INTERVAL_MS = 200;    // 桌面端 confirm_interval
-    private static final double ENGINE_STEP_TIME_SEC = 5.0; // Windows EngineStepTime
+    // 桌面端 EngineStepTime=5000ms：桌面 CPU 5s 内常能提前到达 depth 20 收工，手机到不了、
+    // 只会每步吃满时限，故移动端下调为 2s（配套 MainActivity 默认深度 16，让"深度先到、
+    // 提前收工"重新成为常态，行为模式对齐桌面端而非参数值对齐）
+    private static final double ENGINE_STEP_TIME_SEC = 2.0;
+    // 云库命中但缺次优候选时的补充搜索：只为凑 MultiPV 备选，最优招/评分仍以云库为准，
+    // 用短时限避免这轮"纯展示性搜索"拖慢出招
+    private static final double SUPPLEMENT_SEARCH_TIME_SEC = 1.0;
     private static final int NO_BOARD_RESET_THRESHOLD = 3;  // 连续识别失败后重置棋盘定位缓存
     private static final int PHASH_SIZE = 32;
     private static final int PHASH_THRESHOLD = 2;
@@ -72,7 +78,7 @@ public class AnalysisService extends Service {
 
     private EngineHelper engineHelper;
     private volatile boolean isRunning = false;
-    private int calcDepth = 14;
+    private int calcDepth = 16;
 
     // 引擎进程级单例（对齐桌面端 SHARED_STATE/OnceLock 语义）：native 层的输出回调是
     // 全局注册的，若每个 Service 实例新建 EngineHelper，重开会话后 bestmove 会回给
@@ -195,7 +201,7 @@ public class AnalysisService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         int resultCode = intent.getIntExtra("resultCode", 0);
         Intent resultData = intent.getParcelableExtra("data");
-        calcDepth = intent.getIntExtra("depth", 20);
+        calcDepth = intent.getIntExtra("depth", 16);
 
         if (resultCode != 0 && resultData != null) {
             if (virtualDisplay != null) {
@@ -443,8 +449,10 @@ public class AnalysisService extends Service {
 
         // ① 云库优先（桌面端 search 语义）：chessdb 命中则直接采用其最优线，未命中/网络失败
         //    落本地引擎；云库判非法（多为识别缺子/错子）则按无效帧跳过。
-        //    桌面端同款行为：queryall 无次优时需等本地引擎补一次 MultiPV，此轮耗时≈引擎思考时间
-        ChessDB.Result cloud = queryCloudSafe(f.boardPart + " " + turn, 5, 3, 300);
+        //    桌面端同款行为：queryall 无次优时需等本地引擎补一次 MultiPV（移动端补搜时限
+        //    见 SUPPLEMENT_SEARCH_TIME_SEC）。云库超时 2s：chessdb 正常 RTT 远小于此，
+        //    超过 2s 说明网络差，早落本地引擎不再白等
+        ChessDB.Result cloud = queryCloudSafe(f.boardPart + " " + turn, 2, 3, 300);
         if (ChessDB.STATE_INVALID.equals(cloud.state)) {
             LogUtil.w(TAG, "云库判定局面非法，跳过本轮等待识别恢复");
             restoreWindowIfAnalyzing();
@@ -462,7 +470,7 @@ public class AnalysisService extends Service {
             // 未评全所有着法），云库命中但无次优候选时，用本地引擎 MultiPV 补充次优。
             // 只补候选：最优招/评分/深度/来源仍以云库为准
             if (r.alternatives.isEmpty()) {
-                EngineHelper.SearchResult eng = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+                EngineHelper.SearchResult eng = engineHelper.searchSync(finalFen, SUPPLEMENT_SEARCH_TIME_SEC, calcDepth);
                 if (eng != null && eng.alternatives != null) {
                     for (EngineHelper.AltCandidate alt : eng.alternatives) {
                         if (r.alternatives.size() >= 2) break;   // multipv(3)-1 个上限

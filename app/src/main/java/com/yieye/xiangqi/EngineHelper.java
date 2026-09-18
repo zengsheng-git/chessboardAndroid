@@ -123,8 +123,10 @@ public class EngineHelper {
                     setOption("EvalFile", nnueFile.getAbsolutePath());
                 }
 
-                // 引擎设置对齐桌面端 chessboard（lib.rs: Hash=64 / Threads=4 / ShowWDL=false，
-                // Sixty Move Rule=false 于 Engine::new 设置；Slow Mover 桌面端不设置=默认 100）
+                // 引擎设置对齐桌面端 chessboard（config.rs EngineConfig::default：Hash=64 /
+                // Threads=4 / multipv=3；Sixty Move Rule=false 于 Engine::from_child 设置；
+                // Slow Mover 两端均不设置=默认 100。桌面默认 UCI_ShowWDL=true 仅多打 WDL
+                // 输出，SearchCollector 不消费该字段，Android 不设=默认 false，不影响搜索）
                 setOption("Hash", "64");
                 setOption("Threads", "4");
                 setOption("Sixty Move Rule", "false");

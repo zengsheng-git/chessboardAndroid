@@ -151,12 +151,13 @@ public class MainActivity extends AppCompatActivity {
         spinnerDepth.setAdapter(adapter);
 
         android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
-        // 0.0.23 起默认深度与桌面端对齐为 20：一次性迁移老版本残留的旧默认值 14
+        // 0.0.23 曾与桌面端对齐为 20；0.0.36 起移动端按手机硬件取值（movetime 2s）：
+        // 20 层在时限内几乎不可达、只会每步吃满时限，故一次性迁移为 16
         //（此后用户手动选择的值正常保存，迁移不会再次触发）
-        if (prefs.getInt("depth_migrated", 0) < 23) {
-            prefs.edit().putInt("depth_migrated", 23).putInt(KEY_DEPTH, 20).apply();
+        if (prefs.getInt("depth_migrated", 0) < 36) {
+            prefs.edit().putInt("depth_migrated", 36).putInt(KEY_DEPTH, 16).apply();
         }
-        int savedDepth = prefs.getInt(KEY_DEPTH, 20);
+        int savedDepth = prefs.getInt(KEY_DEPTH, 16);
         int selection = depths.indexOf(savedDepth);
         if (selection >= 0) {
             spinnerDepth.setSelection(selection);

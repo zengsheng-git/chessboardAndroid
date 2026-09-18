@@ -48,7 +48,7 @@ public final class ChessDB {
         try {
             String url = URL + "?action=querypv&board=" + URLEncoder.encode(fen, "UTF-8");
             conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(5000);
+            conn.setConnectTimeout(2000);
             conn.setReadTimeout(timeoutSec * 1000);
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Referer", REFERER);
@@ -127,7 +127,7 @@ public final class ChessDB {
         try {
             String url = URL + "?action=queryall&board=" + URLEncoder.encode(fen, "UTF-8");
             conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(5000);
+            conn.setConnectTimeout(2000);
             conn.setReadTimeout(timeoutSec * 1000);
             conn.setRequestProperty("User-Agent", UA);
             conn.setRequestProperty("Referer", REFERER);

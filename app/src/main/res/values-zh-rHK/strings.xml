@@ -7,6 +7,7 @@
     <string name="stop_analysis">停止分析服務</string>
     <string name="board_recognition_debug">棋盤識別調試</string>
     <string name="calculation_depth">計算深度:</string>
+    <string name="hint_strength">提示強度:</string>
     <string name="waiting_analysis">等待分析...</string>
     <string name="analysis_service_started">分析服務已啟動</string>
     <string name="grant_float_permission_tip">請授予懸浮窗權限以顯示推薦走法</string>

@@ -29,8 +29,16 @@ public class MainActivity extends AppCompatActivity {
     private android.view.View permissionLayout;
     private Button btnStartService;
     private android.widget.Spinner spinnerDepth;
+    private android.widget.Spinner spinnerHint;
     private static final String PREFS_NAME = "ChessPrefs";
     private static final String KEY_DEPTH = "calc_depth";
+    private static final String KEY_HINT = "hint_level";
+    // 提示强度档位：0=不限，1~5 对应固定搜索深度 2/4/6/8/12（弱化提示，练棋用）。
+    // 标签里的"约业几"为自对弈实测推算的参考段位（天天象棋口径），非官方校准
+    private static final String[] HINT_LABELS = {
+            "不限（最强）", "新手（约业2-3）", "入门（约业4-5）",
+            "初级（约业5-6）", "中级（约业7-8）", "高级（约业9+）"
+    };
 
     private BroadcastReceiver resultReceiver = new BroadcastReceiver() {
         @Override
@@ -62,6 +70,7 @@ public class MainActivity extends AppCompatActivity {
         Button btnBatterySetting = findViewById(R.id.btnBatterySetting);
 
         initDepthSpinner();
+        initHintSpinner();
         initBoardMirrorToggle();
 
         btnBatterySetting.setOnClickListener(v -> {
@@ -176,6 +185,31 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    /** 提示强度档位：立即持久化；启动分析时随 Intent 传给服务 */
+    private void initHintSpinner() {
+        spinnerHint = (android.widget.Spinner) findViewById(R.id.spinnerHint);
+        android.widget.ArrayAdapter<String> adapter = new android.widget.ArrayAdapter<>(this,
+                android.R.layout.simple_spinner_item, HINT_LABELS);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinnerHint.setAdapter(adapter);
+
+        android.content.SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        int saved = prefs.getInt(KEY_HINT, 0);
+        if (saved >= 0 && saved < HINT_LABELS.length) {
+            spinnerHint.setSelection(saved);
+        }
+        spinnerHint.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override
+            public void onItemSelected(android.widget.AdapterView<?> parent, android.view.View view, int position, long id) {
+                prefs.edit().putInt(KEY_HINT, position).apply();
+            }
+
+            @Override
+            public void onNothingSelected(android.widget.AdapterView<?> parent) {
+            }
+        });
+    }
+
     /** 棋盘镜像悬浮窗开关：立即生效并持久化，服务下次启动也按此开关显示 */
     private void initBoardMirrorToggle() {
         CheckBox boardToggle = findViewById(R.id.checkboxBoardMirror);
@@ -204,6 +238,7 @@ public class MainActivity extends AppCompatActivity {
             serviceIntent.putExtra("resultCode", resultCode);
             serviceIntent.putExtra("data", data);
             serviceIntent.putExtra("depth", (int) spinnerDepth.getSelectedItem());
+            serviceIntent.putExtra("hintLevel", spinnerHint.getSelectedItemPosition());
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(serviceIntent);
             } else {

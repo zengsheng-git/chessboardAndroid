@@ -6,4 +6,5 @@
     <string name="start_analysis">Start Analysis Service</string>
     <string name="stop_analysis">Stop Analysis Service</string>
     <string name="board_recognition_debug">Board Recognition Debug</string>
+    <string name="hint_strength">Hint Strength:</string>
 </resources>

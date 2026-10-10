@@ -291,6 +291,27 @@ public class EngineHelper {
     }
 
     /**
+     * 清空引擎置换表并等待处理完毕（对齐桌面端 ucinewgame + isready/readyok 同步）。
+     * 档位切换时调用：深档（如 depth 16）留下的置换表条目会让浅档搜索直接命中
+     * 深层旧结论，出招仍然过强——"记住强招"的元凶，与桌面端同一问题同一修法。
+     * 引擎为进程级单例跨会话复用，TT 跨会话残留，不清则弱档永远偏强。
+     */
+    public void newGame() {
+        isReadyOk = false;
+        sendCommand("ucinewgame");
+        sendCommand("isready");
+        long start = System.currentTimeMillis();
+        while (!isReadyOk && System.currentTimeMillis() - start < 2000) {
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+    }
+
+    /**
      * 阻塞式搜索（对齐桌面端 block_on(engine.search())）：发出 position+go 后等待
      * bestmove 才返回。与截屏循环在同一条线程串行调用，任何时刻最多一个在途搜索，
      * position/go 永远不会发进正在搜索的引擎——并发分析类竞态在结构上不存在。

@@ -65,6 +65,31 @@ public class AnalysisService extends Service {
     // 标准开局 FEN（parser 输出的棋盘段恒为"红在下"的标准方向，可直接字符串比较）
     private static final String STARTPOS_BOARD = "rnbakabnr/9/1c5c1/p1p1p1p1p/9/9/P1P1P1P1P/1C2C4/9/RNBAKABNR";
 
+    /**
+     * 提示强度档位（对齐桌面端 chessboard hint_level 语义与深度映射）：
+     * 0 = 不限（云库优先 + 本地引擎按 calcDepth 搜索）；1~5 = 固定浅深度的弱化档——
+     * 每一手都出自同一浅思考深度，招法水平整体一致（放水式 Skill Level 是逐手掷骰子，
+     * 做不到"整体都弱"，桌面端已实测弃用）。档位>0 时跳过云库：云库只回最优招，
+     * 不跳过则强度设置形同虚设；深度仍受 movetime 双上限约束（谁先到谁生效）
+     */
+    private int hintLevel = 0;
+
+    // 最近一次成功分析的局面快照：档位切换时即使画面未变，也按此局面立即重算提示
+    // （对齐桌面端 worker.rs 的 HINT_LEVEL_VERSION 立即重算机制）
+    private String lastFen = null;
+    private boolean lastBottomIsRed = false;
+    /** 档位 → 搜索深度（对齐桌面端 engine/mod.rs hint_depth 的映射与实测校准） */
+    private static int hintDepth(int level) {
+        switch (level) {
+            case 1: return 2;   // 新手：会漏简单吃子/被将应对
+            case 2: return 4;   // 入门：不白送子，但缺战术远见
+            case 3: return 6;   // 初级：基本战术成型
+            case 4: return 8;   // 中级：战术扎实
+            case 5: return 12;  // 高级：接近满强度但缺残局精度
+            default: return -1; // 不限
+        }
+    }
+
     /** 桌面端 ChessboardState：StartPos 并入 GENERIC（后续行为一致，仅首次启发式行棋方不同） */
     private enum ChessboardState { INITIAL, GENERIC, INVALID }
 
@@ -98,6 +123,9 @@ public class AnalysisService extends Service {
     private int[] lastKnownRedKing = null;
     private int[] lastKnownBlackKing = null;
     private static final String PREFS_KING_MEM = "king_memory";
+    // 主界面偏好（与 MainActivity 的 PREFS_NAME/KEY_HINT 同名）：提示强度档位
+    private static final String PREFS_MAIN = "ChessPrefs";
+    private static final String KEY_HINT_LEVEL = "hint_level";
     private int noBoardCount = 0;             // 连续识别失败计数（无棋子/无棋盘）
     private String lastResult = "";           // 最近一次成功显示的提示（静默期恢复用）
     private boolean windowShowsAnalyzing = false; // 悬浮窗当前是否停留在"正在分析"（用于静默期恢复）
@@ -298,6 +326,28 @@ public class AnalysisService extends Service {
 
     /** 一拍：截屏识别 → 状态机分类 → 需要时阻塞分析（桌面端循环主体） */
     private void step() {
+        // 档位切换检测（每拍最先执行，对齐桌面端同款问题同款修法）：
+        // 1) ucinewgame 清置换表：深档留下的 TT 条目会让浅档命中深层旧结论，出招仍强；
+        // 2) 即使画面/棋盘未变（pHash 拦截或状态机 break）也立即按新档位重算当前局面，
+        //    旧提示不再挂到下一次走子
+        int prefLevel = getSharedPreferences(PREFS_MAIN, Context.MODE_PRIVATE).getInt(KEY_HINT_LEVEL, 0);
+        if (prefLevel != hintLevel) {
+            LogUtil.i(TAG, "检测到提示档位切换 " + hintLevel + " -> " + prefLevel);
+            hintLevel = prefLevel;
+            if (engineHelper.initialized) engineHelper.newGame();
+            if (lastFen != null) {
+                Frame rf = new Frame();
+                rf.fen = lastFen;
+                rf.boardPart = lastFen.split(" ")[0];
+                rf.board = Utils.fenToBoard(lastFen);
+                rf.bottomIsRed = lastBottomIsRed;
+                String turn = nextTurn != null ? nextTurn : (rf.bottomIsRed ? "w" : "b");
+                LogUtil.i(TAG, "按新档位重算当前局面");
+                analyzePosition(rf, turn);
+                return;
+            }
+        }
+
         // INITIAL 状态（首次/重置后重新锚定）必须强制识别：进入 INITIAL 时画面往往
         // 与上一拍相同，pHash 去重会把这一拍吞掉，导致永远停在 INITIAL 不分析
         Frame f = captureFrame(state == ChessboardState.INITIAL);
@@ -430,10 +480,13 @@ public class AnalysisService extends Service {
      * 该结果已过期，不显示，等下一拍循环去分析新局面。
      */
     private void analyzePosition(Frame f, String turn) {
+        // 档位由 step() 每拍检测（变更时清置换表+立即重算）后写入 hintLevel 字段，这里直接使用
+        LogUtil.i(TAG, "hintLevel=" + hintLevel);
         nextTurn = turn;
         untrustedCount = 0; // 成功进入分析 = 帧已可信，重置噪声计数
         String finalFen = f.boardPart + " " + turn + " - - 0 1";
-        // 非法局面会导致 Pikafish 原生层崩溃，提前拦截（双保险，searchSync 内部也会校验）
+        lastFen = finalFen;            // 快照：供档位切换时按原局面立即重算
+        lastBottomIsRed = f.bottomIsRed;        // 非法局面会导致 Pikafish 原生层崩溃，提前拦截（双保险，searchSync 内部也会校验）
         if (!engineHelper.isValidFen(finalFen)) {
             FloatWindowManager.getInstance(this).updateMove(getString(R.string.waiting_recognition));
             return;
@@ -447,6 +500,12 @@ public class AnalysisService extends Service {
         String source = null;
         EngineHelper.SearchResult r;
 
+        // 提示强度档位>0：跳过云库（云库永远返回最优招，不跳过则强度设置形同虚设），
+        // 直接走本地引擎按档位深度搜索（对齐桌面端 engine/mod.rs search 的档位行为）
+        if (hintLevel > 0) {
+            source = "引擎";
+            r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, hintDepth(hintLevel));
+        } else {
         // ① 云库优先（桌面端 search 语义）：chessdb 命中则直接采用其最优线，未命中/网络失败
         //    落本地引擎；云库判非法（多为识别缺子/错子）则按无效帧跳过。
         //    桌面端同款行为：queryall 无次优时需等本地引擎补一次 MultiPV（移动端补搜时限
@@ -485,7 +544,9 @@ public class AnalysisService extends Service {
             }
         } else {
             source = "引擎";
-            r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC, calcDepth);
+            r = engineHelper.searchSync(finalFen, ENGINE_STEP_TIME_SEC,
+                    hintLevel > 0 ? hintDepth(hintLevel) : calcDepth);
+        }
         }
         long engineTime = System.currentTimeMillis() - startedAt;
 

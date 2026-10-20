@@ -3,6 +3,7 @@ package com.yieye.xiangqi;
 import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Path;
 import android.graphics.RectF;
 import android.util.AttributeSet;
 import android.view.View;
@@ -10,10 +11,11 @@ import android.view.View;
 import java.util.List;
 
 /**
- * 棋盘镜像悬浮窗的自绘棋盘（桌面端 Chessboard.vue"镜像 + 走子/候选高亮"的等价物）。
+ * 棋盘镜像悬浮窗的自绘棋盘（桌面端 Chessboard.vue"镜像 + 招法箭头"的等价物）。
  * 输入为识别管线的屏幕方向数组（Frame.board：数组底部 = 真实屏幕底部，直接绘制即
- * 与实际棋盘方向一致，无需再翻转）；最优招（蓝）与次优候选（紫）的 iccs 高亮经
- * Utils.move2Point(move, bottomIsRed) 转换到同一数组坐标系。
+ * 与实际棋盘方向一致，无需再翻转）；最优招与次优候选的 iccs 经 Utils.move2Point(move,
+ * bottomIsRed) 转换到同一数组坐标系，以箭头绘制（对齐桌面端 src/arrows.ts）：
+ * 最优按行棋方着色（红方行棋=红箭头、黑方行棋=蓝箭头），次优为紫色细箭头。
  */
 public class BoardView extends View {
     private static final int COLOR_BG = 0x80EAC98F;        // 木纹底（50% 透明，与文字悬浮框一致，透出真实棋盘）
@@ -22,15 +24,16 @@ public class BoardView extends View {
     private static final int COLOR_BLACK = 0xFF263238;     // 黑方棋子
     private static final int COLOR_PIECE_BG = 0xFFFFF3D9;  // 棋子底色
     private static final int COLOR_RIVER = 0xFF8D6E63;     // 楚河汉界
-    private static final int HL_BEST_FILL = 0x403498DB;    // 最优招高亮：3px 级描边 + 25% 底（桌面端 b/r-select）
-    private static final int HL_BEST_LINE = 0xFF3498DB;
-    private static final int HL_ALT_FILL = 0x339B59B6;     // 次优候选高亮：2px 级描边（桌面端 alt-select）
-    private static final int HL_ALT_LINE = 0xFF9B59B6;
+    // 招法箭头（桌面端 #e74c3c/#3498db/#9b59b6, 整体 85% 不透明度）
+    private static final int ARROW_BEST_RED = 0xD9E74C3C;  // 最优招: 红方行棋
+    private static final int ARROW_BEST_BLUE = 0xD93498DB; // 最优招: 黑方行棋
+    private static final int ARROW_ALT = 0xD99B59B6;       // 次优候选
 
     private String[][] board;        // 归一化棋盘（红在下），null = 空棋盘
     private boolean bottomIsRed = true;
     private String bestMove;         // 最优招 iccs（如 h2e2）
     private List<String> altMoves;   // 次优候选 iccs
+    private boolean redToMove = true; // 最优招的行棋方（true=红方），决定箭头颜色
 
     private final Paint bgPaint = paint(COLOR_BG, Paint.Style.FILL, 0);
     private final Paint linePaint = paint(COLOR_LINE, Paint.Style.STROKE, 2f);
@@ -39,14 +42,15 @@ public class BoardView extends View {
     private final Paint pieceFillPaint = paint(COLOR_PIECE_BG, Paint.Style.FILL, 0);
     private final Paint pieceStrokePaint = paint(COLOR_BLACK, Paint.Style.STROKE, 2f);
     private final Paint pieceTextPaint = paint(COLOR_BLACK, Paint.Style.FILL, 0);
-    private final Paint hlFillPaint = paint(0, Paint.Style.FILL, 0);
-    private final Paint hlLinePaint = paint(0, Paint.Style.STROKE, 2f);
+    private final Paint arrowPaint = paint(0, Paint.Style.STROKE, 0);
+    private final Paint arrowHeadPaint = paint(0, Paint.Style.FILL, 0);
+    private final Path arrowHeadPath = new Path();
 
     public BoardView(Context context, AttributeSet attrs) {
         super(context, attrs);
         riverPaint.setTextAlign(Paint.Align.CENTER);
         pieceTextPaint.setTextAlign(Paint.Align.CENTER);
-        hlLinePaint.setStrokeJoin(Paint.Join.ROUND);
+        arrowPaint.setStrokeCap(Paint.Cap.ROUND);
     }
 
     private static Paint paint(int color, Paint.Style style, float width) {
@@ -57,8 +61,8 @@ public class BoardView extends View {
         return p;
     }
 
-    /** 更新棋盘与高亮；任意参数可为 null（清空对应元素）。可在任意线程调用 */
-    public void setState(String[][] board, boolean bottomIsRed, String bestMove, List<String> altMoves) {
+    /** 更新棋盘与提示箭头；任意参数可为 null（清空对应元素）。可在任意线程调用 */
+    public void setState(String[][] board, boolean bottomIsRed, String bestMove, List<String> altMoves, boolean redToMove) {
         if (board != null) {
             String[][] copy = new String[9][10];
             for (int x = 0; x < 9; x++) System.arraycopy(board[x], 0, copy[x], 0, 10);
@@ -69,6 +73,7 @@ public class BoardView extends View {
         this.bottomIsRed = bottomIsRed;
         this.bestMove = bestMove;
         this.altMoves = altMoves;
+        this.redToMove = redToMove;
         invalidate();
     }
 
@@ -81,13 +86,6 @@ public class BoardView extends View {
         float ox = (w - 8 * cell) / 2f, oy = (h - 9 * cell) / 2f;
 
         canvas.drawRoundRect(new RectF(2, 2, w - 2, h - 2), 10, 10, bgPaint);
-
-        // 高亮画在底色之上、网格与棋子之下（最优招边框加粗至格宽 12%，次优 5%，
-        // 按格宽比例随缩放同步变化）
-        drawMoveHighlight(canvas, ox, oy, cell, bestMove, HL_BEST_FILL, HL_BEST_LINE, 0.12f);
-        if (altMoves != null) {
-            for (String mv : altMoves) drawMoveHighlight(canvas, ox, oy, cell, mv, HL_ALT_FILL, HL_ALT_LINE, 0.05f);
-        }
 
         // 横线 10 条
         for (int y = 0; y < 10; y++) {
@@ -144,24 +142,49 @@ public class BoardView extends View {
                 }
             }
         }
+
+        // 箭头叠在棋子上方（对齐桌面端 z-index 布局）：最优招按行棋方红/蓝着色，次优紫细箭头
+        drawMoveArrow(canvas, ox, oy, cell, bestMove, redToMove ? ARROW_BEST_RED : ARROW_BEST_BLUE, 0.125f, 0.35f, 0.20f);
+        if (altMoves != null) {
+            for (String mv : altMoves) drawMoveArrow(canvas, ox, oy, cell, mv, ARROW_ALT, 0.0875f, 0.275f, 0.1625f);
+        }
     }
 
-    /** 高亮一步招法的起点与终点（iccs 4 字符，如 h2e2）；borderScale 为相对格宽的边框粗细 */
-    private void drawMoveHighlight(Canvas c, float ox, float oy, float cell, String mv, int fill, int line, float borderScale) {
+    /**
+     * 以箭头绘制一步招法（iccs 4 字符，如 h2e2）：起点交点 -> 终点交点。
+     * 箭尾从起点棋子边缘让开（0.30 cell），箭尖直达终点交点（盖在落点棋子上，去向一目了然）；
+     * stroke/head/half 为箭杆粗细、箭头长度与半宽相对格距的比例（对齐桌面端 5/40、14/40、8/40）。
+     */
+    private void drawMoveArrow(Canvas c, float ox, float oy, float cell, String mv, int color,
+                               float stroke, float head, float half) {
         if (mv == null || mv.length() < 4) return;
-        hlFillPaint.setColor(fill);
-        hlLinePaint.setColor(line);
-        hlLinePaint.setStrokeWidth(cell * borderScale);
-        for (int i = 0; i < 2; i++) {
-            String sq = mv.substring(i * 2, i * 2 + 2);
-            android.graphics.Point p = Utils.move2Point(sq, bottomIsRed);
-            if (p.x < 0 || p.x > 8 || p.y < 0 || p.y > 9) continue;
-            float[] pt = pt(ox, oy, cell, p.x, p.y);
-            float s = cell * 0.46f;
-            RectF rect = new RectF(pt[0] - s, pt[1] - s, pt[0] + s, pt[1] + s);
-            c.drawRoundRect(rect, 6, 6, hlFillPaint);
-            c.drawRoundRect(rect, 6, 6, hlLinePaint);
-        }
+        android.graphics.Point from = Utils.move2Point(mv.substring(0, 2), bottomIsRed);
+        android.graphics.Point to = Utils.move2Point(mv.substring(2, 4), bottomIsRed);
+        if (from.x < 0 || from.x > 8 || from.y < 0 || from.y > 9) return;
+        if (to.x < 0 || to.x > 8 || to.y < 0 || to.y > 9) return;
+        float[] a = pt(ox, oy, cell, from.x, from.y);
+        float[] b = pt(ox, oy, cell, to.x, to.y);
+        float dx = b[0] - a[0], dy = b[1] - a[1];
+        double len = Math.hypot(dx, dy);
+        if (len < cell * 0.5) return; // 起落点重合或过近，不绘制
+        float ux = (float) (dx / len), uy = (float) (dy / len);
+        float px = -uy, py = ux;
+        float tailX = a[0] + ux * cell * 0.30f, tailY = a[1] + uy * cell * 0.30f;
+        float headLen = cell * head;
+        // 箭杆略探入箭头底部，避免杆头与三角间留缝
+        float endX = b[0] - ux * (headLen - cell * 0.05f), endY = b[1] - uy * (headLen - cell * 0.05f);
+        float baseX = b[0] - ux * headLen, baseY = b[1] - uy * headLen;
+        float hw = cell * half;
+        arrowPaint.setColor(color);
+        arrowPaint.setStrokeWidth(cell * stroke);
+        c.drawLine(tailX, tailY, endX, endY, arrowPaint);
+        arrowHeadPath.rewind();
+        arrowHeadPath.moveTo(b[0], b[1]);
+        arrowHeadPath.lineTo(baseX + px * hw, baseY + py * hw);
+        arrowHeadPath.lineTo(baseX - px * hw, baseY - py * hw);
+        arrowHeadPath.close();
+        arrowHeadPaint.setColor(color);
+        c.drawPath(arrowHeadPath, arrowHeadPaint);
     }
 
     private void drawSeg(Canvas c, float ox, float oy, float cell, int x1, int y1, int x2, int y2) {

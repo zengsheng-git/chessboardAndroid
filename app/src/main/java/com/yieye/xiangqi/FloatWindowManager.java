@@ -229,13 +229,13 @@ public class FloatWindowManager {
 
     /**
      * 更新棋盘镜像：屏幕方向棋盘（Frame.board，数组底部=屏幕底部，直接绘制即镜像
-     * 实际方向）+ 最优招/次优候选的 iccs 高亮（经 move2Point 转换）。
+     * 实际方向）+ 最优招/次优候选的 iccs 箭头（经 move2Point 转换；最优按行棋方红/蓝着色）。
      * 棋盘窗未开启时静默忽略。可在任意线程调用。
      */
-    public void updateBoard(String[][] board, boolean bottomIsRed, String bestMove, java.util.List<String> altMoves) {
+    public void updateBoard(String[][] board, boolean bottomIsRed, String bestMove, java.util.List<String> altMoves, boolean redToMove) {
         final BoardView v = boardContent;
         if (v == null) return;
-        v.post(() -> v.setState(board, bottomIsRed, bestMove, altMoves));
+        v.post(() -> v.setState(board, bottomIsRed, bestMove, altMoves, redToMove));
     }
 
     public void hide() {

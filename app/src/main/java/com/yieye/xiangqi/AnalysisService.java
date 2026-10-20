@@ -587,7 +587,8 @@ public class AnalysisService extends Service {
         String chinaMove2 = (r.ponderMove != null && r.ponderMove.length() >= 4 && !"(none)".equals(r.ponderMove))
                 ? Utils.fenToChina(this, finalFen, r.ponderMove, f.bottomIsRed) : getString(R.string.none_ponder);
 
-        String turnStr = finalFen.contains(" w ") ? getString(R.string.turn_red) : getString(R.string.turn_black);
+        boolean redToMove = finalFen.contains(" w ");
+        String turnStr = redToMove ? getString(R.string.turn_red) : getString(R.string.turn_black);
 
         // ③ 次优候选（仅本地引擎 MultiPV 提供）：分数与最优差 ≤ alt_score_gap 的名次首着，
         //    括号内为与最优的相对分数（负值 = 比最优差多少），供直观判断候选质量
@@ -604,12 +605,12 @@ public class AnalysisService extends Service {
         String altText = altTextSb.toString();
         String evalText = formatEval(r.score);
 
-        // ④ 棋盘镜像悬浮窗：屏幕方向棋盘（数组底部=屏幕底部）+ 最优招（蓝）/次优候选（紫）落点高亮
+        // ④ 棋盘镜像悬浮窗：屏幕方向棋盘（数组底部=屏幕底部）+ 最优招箭头（按行棋方红/蓝）/次优候选（紫）
         List<String> altIccs = new ArrayList<>();
         if (r.alternatives != null) {
             for (EngineHelper.AltCandidate a : r.alternatives) altIccs.add(a.move);
         }
-        FloatWindowManager.getInstance(this).updateBoard(f.board, f.bottomIsRed, r.bestMove, altIccs);
+        FloatWindowManager.getInstance(this).updateBoard(f.board, f.bottomIsRed, r.bestMove, altIccs, redToMove);
 
         // 悬浮窗富文本（配色对齐桌面端 Analyse.vue）：
         // 推荐招法=蓝(info) 深度=橙(warning) 备选招法=紫(#9b59b6) 形势=优绿/劣红 均势灰
